@@ -5,6 +5,7 @@ import UIKit
 @MainActor
 final class CaptionPiPHostView: UIView {
     var didMount: (() -> Void)?
+    private var hasNotifiedMount = false
 
     override class var layerClass: AnyClass {
         AVSampleBufferDisplayLayer.self
@@ -37,9 +38,13 @@ final class CaptionPiPHostView: UIView {
     }
 
     private func notifyIfMounted() {
-        guard window != nil, bounds.width > 0, bounds.height > 0 else {
+        guard !hasNotifiedMount,
+              window != nil,
+              bounds.width > 0,
+              bounds.height > 0 else {
             return
         }
+        hasNotifiedMount = true
         didMount?()
     }
 }

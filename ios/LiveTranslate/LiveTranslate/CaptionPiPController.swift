@@ -33,13 +33,14 @@ enum CaptionPiPStartState: Equatable {
 final class CaptionPiPController: NSObject, ObservableObject {
     private let renderer: CaptionFrameRenderer
     private let renderSize: CGSize
-    private let audioSession: any CaptionPiPAudioSessionPreparing
+    private let pictureInPictureFactory: any CaptionPiPLifecycleFactory
+    private let isPictureInPictureSupported: () -> Bool
     let hostView: CaptionPiPHostView
     var displayLayer: AVSampleBufferDisplayLayer {
         hostView.captionDisplayLayer
     }
-    private var pictureInPictureController: AVPictureInPictureController?
-    private var readinessObservation: NSKeyValueObservation?
+    private var pictureInPictureLifecycle: (any CaptionPiPLifecycleControlling)?
+    private var readinessObservation: (any CaptionPiPReadinessObserving)?
     private var lastRenderedRevision: UInt64?
     private var startupCoordinator: CaptionPiPStartupCoordinator!
 
@@ -50,17 +51,22 @@ final class CaptionPiPController: NSObject, ObservableObject {
     init(
         renderer: CaptionFrameRenderer = CaptionFrameRenderer(),
         renderSize: CGSize = CGSize(width: 960, height: 320),
-        audioSession: any CaptionPiPAudioSessionPreparing = SystemCaptionPiPAudioSessionPreparer()
+        audioSession: any CaptionPiPAudioSessionPreparing = SystemCaptionPiPAudioSessionPreparer(),
+        pictureInPictureFactory: any CaptionPiPLifecycleFactory = SystemCaptionPiPLifecycleFactory(),
+        isPictureInPictureSupported: @escaping () -> Bool = {
+            AVPictureInPictureController.isPictureInPictureSupported()
+        }
     ) {
         self.renderer = renderer
         self.renderSize = renderSize
-        self.audioSession = audioSession
+        self.pictureInPictureFactory = pictureInPictureFactory
+        self.isPictureInPictureSupported = isPictureInPictureSupported
         hostView = CaptionPiPHostView()
         super.init()
         startupCoordinator = CaptionPiPStartupCoordinator(
             audioSession: audioSession,
             startPictureInPicture: { [weak self] in
-                self?.pictureInPictureController?.startPictureInPicture()
+                self?.pictureInPictureLifecycle?.startPictureInPicture()
             },
             stateDidChange: { [weak self] state in
                 self?.startState = state
@@ -72,7 +78,7 @@ final class CaptionPiPController: NSObject, ObservableObject {
     }
 
     var isSupported: Bool {
-        AVPictureInPictureController.isPictureInPictureSupported()
+        isPictureInPictureSupported()
     }
 
     func start() {
@@ -81,7 +87,7 @@ final class CaptionPiPController: NSObject, ObservableObject {
     }
 
     func stop() {
-        pictureInPictureController?.stopPictureInPicture()
+        pictureInPictureLifecycle?.stopPictureInPicture()
         readinessObservation?.invalidate()
         readinessObservation = nil
         resetForNextStart()
@@ -96,13 +102,19 @@ final class CaptionPiPController: NSObject, ObservableObject {
             return
         }
 
-        let source = AVPictureInPictureController.ContentSource(
+        let lifecycle = pictureInPictureFactory.makePictureInPictureLifecycle(
             sampleBufferDisplayLayer: displayLayer,
             playbackDelegate: self
         )
-        let controller = AVPictureInPictureController(contentSource: source)
-        controller.delegate = self
-        pictureInPictureController = controller
+        lifecycle.setEventHandlers(
+            didStop: { [weak self] in
+                self?.handlePictureInPictureDidStop()
+            },
+            didFailToStart: { [weak self] errorDescription in
+                self?.startupCoordinator.didFailToStart(errorDescription: errorDescription)
+            }
+        )
+        pictureInPictureLifecycle = lifecycle
         isReadyForPictureInPicture = true
         installReadinessObservation()
     }
@@ -159,17 +171,12 @@ final class CaptionPiPController: NSObject, ObservableObject {
     }
 
     private func installReadinessObservation() {
-        guard let pictureInPictureController, readinessObservation == nil else {
+        guard let pictureInPictureLifecycle, readinessObservation == nil else {
             return
         }
-        readinessObservation = pictureInPictureController.observe(
-            \.isPictureInPicturePossible,
-            options: [.initial, .new]
-        ) { [weak self] controller, _ in
+        readinessObservation = pictureInPictureLifecycle.observeReadiness { [weak self] isPossible in
             Task { @MainActor [weak self] in
-                self?.startupCoordinator.readinessDidChange(
-                    controller.isPictureInPicturePossible
-                )
+                self?.startupCoordinator.readinessDidChange(isPossible)
             }
         }
     }
@@ -179,8 +186,18 @@ final class CaptionPiPController: NSObject, ObservableObject {
         startupCoordinator.stop()
     }
 
-    deinit {
+    private func handlePictureInPictureDidStop() {
         readinessObservation?.invalidate()
+        readinessObservation = nil
+        resetForNextStart()
+        didStop?()
+    }
+
+    deinit {
+        let readinessObservation = readinessObservation
+        Task { @MainActor in
+            readinessObservation?.invalidate()
+        }
     }
 }
 
@@ -217,22 +234,4 @@ extension CaptionPiPController: AVPictureInPictureSampleBufferPlaybackDelegate {
         skipByInterval skipInterval: CMTime
     ) async {}
 
-}
-
-extension CaptionPiPController: AVPictureInPictureControllerDelegate {
-    func pictureInPictureControllerDidStopPictureInPicture(
-        _ pictureInPictureController: AVPictureInPictureController
-    ) {
-        readinessObservation?.invalidate()
-        readinessObservation = nil
-        resetForNextStart()
-        didStop?()
-    }
-
-    func pictureInPictureController(
-        _ pictureInPictureController: AVPictureInPictureController,
-        failedToStartPictureInPictureWithError error: Error
-    ) {
-        startupCoordinator.didFailToStart(errorDescription: error.localizedDescription)
-    }
 }

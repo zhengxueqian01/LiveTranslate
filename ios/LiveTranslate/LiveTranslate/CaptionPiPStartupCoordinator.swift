@@ -2,8 +2,9 @@
 import Foundation
 
 @MainActor
-protocol CaptionPiPAudioSessionPreparing: AnyObject {
+protocol CaptionPiPAudioSessionPreparing: AnyObject, Sendable {
     func prepareForPictureInPicture() throws
+    func releasePictureInPictureAudioSession()
 }
 
 @MainActor
@@ -13,6 +14,17 @@ final class SystemCaptionPiPAudioSessionPreparer: CaptionPiPAudioSessionPreparin
         try audioSession.setCategory(.playback, mode: .moviePlayback, options: [.mixWithOthers])
         try audioSession.setActive(true)
     }
+
+    func releasePictureInPictureAudioSession() {
+        do {
+            try AVAudioSession.sharedInstance().setActive(
+                false,
+                options: [.notifyOthersOnDeactivation]
+            )
+        } catch {
+            // Audio-session teardown must not obscure the original PiP failure.
+        }
+    }
 }
 
 @MainActor
@@ -20,7 +32,9 @@ final class CaptionPiPStartupCoordinator {
     private let audioSession: any CaptionPiPAudioSessionPreparing
     private let startPictureInPicture: () -> Void
     private let stateDidChange: (CaptionPiPStartState) -> Void
+    private let timeout: Duration
     private var isPossible = false
+    private var needsAudioSessionRelease = false
     private var timeoutTask: Task<Void, Never>?
 
     private(set) var isConfigured = false
@@ -29,11 +43,13 @@ final class CaptionPiPStartupCoordinator {
     init(
         audioSession: any CaptionPiPAudioSessionPreparing,
         startPictureInPicture: @escaping () -> Void,
-        stateDidChange: @escaping (CaptionPiPStartState) -> Void = { _ in }
+        stateDidChange: @escaping (CaptionPiPStartState) -> Void = { _ in },
+        timeout: Duration = .seconds(5)
     ) {
         self.audioSession = audioSession
         self.startPictureInPicture = startPictureInPicture
         self.stateDidChange = stateDidChange
+        self.timeout = timeout
     }
 
     func hostDidMount() -> Bool {
@@ -45,11 +61,15 @@ final class CaptionPiPStartupCoordinator {
     }
 
     func requestStart() {
+        guard state != .pending, state != .active else {
+            return
+        }
         guard isConfigured else {
             fail(with: "字幕预览尚未准备好。")
             return
         }
 
+        needsAudioSessionRelease = true
         do {
             try audioSession.prepareForPictureInPicture()
         } catch {
@@ -74,12 +94,16 @@ final class CaptionPiPStartupCoordinator {
     }
 
     func didFailToStart(errorDescription: String) {
+        guard state == .pending || state == .active else {
+            return
+        }
         fail(with: errorDescription)
     }
 
     func stop() {
         timeoutTask?.cancel()
         timeoutTask = nil
+        releaseAudioSessionIfNeeded()
         setState(.idle)
     }
 
@@ -101,9 +125,10 @@ final class CaptionPiPStartupCoordinator {
         guard timeoutTask == nil else {
             return
         }
-        timeoutTask = Task { [weak self] in
+        let timeout = timeout
+        timeoutTask = Task { [weak self, timeout] in
             do {
-                try await Task.sleep(for: .seconds(5))
+                try await Task.sleep(for: timeout)
             } catch is CancellationError {
                 return
             } catch {
@@ -119,7 +144,16 @@ final class CaptionPiPStartupCoordinator {
     private func fail(with reason: String) {
         timeoutTask?.cancel()
         timeoutTask = nil
+        releaseAudioSessionIfNeeded()
         setState(.failed("画中画字幕启动失败：\(reason)"))
+    }
+
+    private func releaseAudioSessionIfNeeded() {
+        guard needsAudioSessionRelease else {
+            return
+        }
+        needsAudioSessionRelease = false
+        audioSession.releasePictureInPictureAudioSession()
     }
 
     private func setState(_ state: CaptionPiPStartState) {
@@ -129,5 +163,12 @@ final class CaptionPiPStartupCoordinator {
 
     deinit {
         timeoutTask?.cancel()
+        guard needsAudioSessionRelease else {
+            return
+        }
+        let audioSession = audioSession
+        Task { @MainActor in
+            audioSession.releasePictureInPictureAudioSession()
+        }
     }
 }
