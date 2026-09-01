@@ -151,7 +151,13 @@ final class AppViewModel: ObservableObject {
             return
         }
         do {
-            latestSnapshot = try store.load()
+            guard let incomingSnapshot = try store.load() else {
+                return
+            }
+            guard latestSnapshot.map({ incomingSnapshot.revision > $0.revision }) ?? true else {
+                return
+            }
+            latestSnapshot = incomingSnapshot
         } catch {
             captionErrorMessage = "字幕状态读取失败：\(error.localizedDescription)"
             refreshErrorMessage()

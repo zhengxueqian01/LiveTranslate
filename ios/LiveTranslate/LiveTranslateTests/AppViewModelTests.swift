@@ -3,6 +3,38 @@ import XCTest
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testOlderCaptionRevisionDoesNotReplaceLatestPreview() throws {
+        let store = InMemoryCaptionStore()
+        let viewModel = AppViewModel(
+            modelService: FakeModelPreparationService(status: .installed),
+            store: store,
+            languageStore: SourceLanguageStore(defaults: .standard)
+        )
+        let newestSnapshot = CaptionSnapshot(
+            revision: 9,
+            sourceText: "newest",
+            translatedText: "最新",
+            phase: .translating,
+            errorMessage: nil,
+            updatedAt: .now
+        )
+        let olderSnapshot = CaptionSnapshot(
+            revision: 8,
+            sourceText: "older",
+            translatedText: "旧的",
+            phase: .translating,
+            errorMessage: nil,
+            updatedAt: .now
+        )
+
+        try store.save(newestSnapshot)
+        viewModel.refreshCaption()
+        try store.save(olderSnapshot)
+        viewModel.refreshCaption()
+
+        XCTAssertEqual(viewModel.latestSnapshot, newestSnapshot)
+    }
+
     func testCaptionObservationRefreshesSharedStoreAfterPollingInterval() async throws {
         let store = InMemoryCaptionStore()
         let viewModel = AppViewModel(

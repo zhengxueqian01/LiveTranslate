@@ -12,7 +12,7 @@ struct ContentView: View {
     @StateObject private var viewModel: AppViewModel
     @State private var translationConfiguration: TranslationSession.Configuration?
     @State private var translationSourceLanguage: SourceLanguage = .english
-    @State private var captionPiPController = CaptionPiPController()
+    @StateObject private var captionPiPController = CaptionPiPController()
 
     init(viewModel: AppViewModel? = nil) {
         _viewModel = StateObject(wrappedValue: viewModel ?? AppViewModel.live())
@@ -53,6 +53,18 @@ struct ContentView: View {
                         Button("打开画中画字幕") {
                             viewModel.startCaptionObservation()
                             captionPiPController.start()
+                            if let snapshot = viewModel.latestSnapshot {
+                                captionPiPController.render(snapshot)
+                            }
+                        }
+                        if let statusMessage = captionPiPController.startState.statusMessage {
+                            Text(statusMessage)
+                                .font(.caption)
+                                .foregroundStyle(
+                                    captionPiPController.startState.isFailure
+                                        ? Color.red
+                                        : Color.secondary
+                                )
                         }
                     }
                 }
