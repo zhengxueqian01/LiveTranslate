@@ -3,7 +3,7 @@
 ## Scope
 
 - Changed `BroadcastPickerView` so `RPSystemBroadcastPickerView` is constructed at the displayed 52 by 52 point size instead of `.zero`.
-- Added a focused UIKit/SwiftUI characterization test. It creates the real representable in a 52 by 52 window, verifies the public picker bounds and ReplayKit configuration, and, when ReplayKit exposes its system button, verifies that button has positive finite bounds. The test does not invoke the button or use private APIs.
+- Added a focused app-owned factory characterization test. It creates the real `RPSystemBroadcastPickerView` before SwiftUI layout and verifies its public initial bounds and ReplayKit configuration. The earlier internal-button inspection is retained only as a historical ReplayKit diagnosis; the current test neither traverses nor invokes private subviews.
 
 ## TDD evidence
 
@@ -50,3 +50,13 @@ The production view now exposes the smallest app-owned construction entry point,
 ### Diagnostic distinction
 
 The factory test's RED/GREEN contract is the constructor-time root `RPSystemBroadcastPickerView` bounds and public ReplayKit configuration. The earlier observed internal `UIButton` zero-height state is a useful real-device/simulator diagnosis of ReplayKit's reaction to a zero construction frame, but it is not a required test precondition and no longer carries the regression test's RED result.
+
+## Fix Round 2/5: constructor mutation evidence
+
+To prove the current factory-focused test observes behavior rather than only the factory's presence, the production factory was temporarily changed from its 52 by 52 frame to `.zero` without staging or committing that state. The same focused test then failed with exit 65 at the constructor root-bounds assertion:
+
+```text
+XCTAssertEqual failed: ("(0.0, 0.0)") is not equal to ("(52.0, 52.0)")
+```
+
+This failure came directly from `BroadcastPickerView.makePicker()` before SwiftUI host layout, and the extension and microphone assertions remained available in the same test. The 52 by 52 constructor frame was then restored, and the identical focused test passed with exit 0. The final production picker file matches commit `498711b`; this round changes only this report.
