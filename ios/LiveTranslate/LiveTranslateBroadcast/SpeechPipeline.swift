@@ -65,9 +65,9 @@ private final class SpeechPipelineRuntime:
             )
     }
 
-    func drainTail() async throws {
+    func drainTail() throws {
         for buffer in try converter.finish() where buffer.frameLength > 0 {
-            try await sendToAnalyzer(buffer)
+            try yieldToAnalyzer(buffer)
         }
     }
 
@@ -94,6 +94,16 @@ private final class SpeechPipelineRuntime:
     private func sendToAnalyzer(_ buffer: AVAudioPCMBuffer) async throws {
         do {
             try await inputQueue.send(AnalyzerInput(buffer: buffer))
+        } catch BoundedAsyncQueueError.dropped {
+            throw SpeechPipelineError.analyzerInputDropped
+        } catch BoundedAsyncQueueError.terminated {
+            throw SpeechPipelineError.finished
+        }
+    }
+
+    private func yieldToAnalyzer(_ buffer: AVAudioPCMBuffer) throws {
+        do {
+            try inputQueue.yield(AnalyzerInput(buffer: buffer))
         } catch BoundedAsyncQueueError.dropped {
             throw SpeechPipelineError.analyzerInputDropped
         } catch BoundedAsyncQueueError.terminated {

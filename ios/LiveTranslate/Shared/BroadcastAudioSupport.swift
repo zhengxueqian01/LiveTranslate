@@ -45,15 +45,20 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
     }
 
     private let capacity: Int
+    private let onSendSuspended: (@Sendable (Value) -> Void)?
     private let lock = NSLock()
     private var bufferedValues: [Value] = []
     private var pendingSenders: [PendingSender] = []
     private var pendingReceivers: [PendingReceiver] = []
     private var isFinished = false
 
-    init(capacity: Int) {
+    init(
+        capacity: Int,
+        onSendSuspended: (@Sendable (Value) -> Void)? = nil
+    ) {
         precondition(capacity > 0)
         self.capacity = capacity
+        self.onSendSuspended = onSendSuspended
     }
 
     func yield(_ value: Value) throws {
@@ -81,6 +86,7 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
                 var receiver: CheckedContinuation<Value?, Never>?
                 var immediateError: (any Error)?
                 var didAccept = false
+                var didSuspend = false
                 lock.withLock {
                     if Task.isCancelled {
                         immediateError = CancellationError()
@@ -100,6 +106,7 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
                                 continuation: continuation
                             )
                         )
+                        didSuspend = true
                     }
                 }
 
@@ -108,6 +115,8 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
                 } else if didAccept {
                     receiver?.resume(returning: value)
                     continuation.resume()
+                } else if didSuspend {
+                    onSendSuspended?(value)
                 }
             }
         } onCancel: {
@@ -206,7 +215,7 @@ protocol SpeechPipelineLifecycleOperations: Sendable {
     associatedtype AppendResult: Sendable
 
     func append(_ sample: Sample) async throws -> AppendResult
-    func drainTail() async throws
+    func drainTail() throws
     func finishInput()
     func finalizeAnalyzer() async throws
     func cancelAnalyzer() async
@@ -218,6 +227,7 @@ actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
     private let operations: Operations
     private let serialExecutor = AsyncSerialExecutor()
     private var terminationTask: Task<Void, any Error>?
+    private var pendingAppendCount = 0
 
     init(operations: Operations) {
         self.operations = operations
@@ -227,9 +237,17 @@ actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
         guard terminationTask == nil else {
             throw SpeechPipelineLifecycleError.finished
         }
+        pendingAppendCount += 1
         let operations = self.operations
-        return try await serialExecutor.run {
-            try await operations.append(sample)
+        do {
+            let result = try await serialExecutor.run {
+                try await operations.append(sample)
+            }
+            pendingAppendCount -= 1
+            return result
+        } catch {
+            pendingAppendCount -= 1
+            throw error
         }
     }
 
@@ -240,9 +258,16 @@ actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
         } else {
             let operations = self.operations
             let serialExecutor = self.serialExecutor
+            let inputAlreadyFinished = pendingAppendCount > 0
+            if inputAlreadyFinished {
+                operations.finishInput()
+            }
             let createdTask = Task<Void, any Error> {
                 try await serialExecutor.run {
-                    try await Self.terminate(operations)
+                    try await Self.terminate(
+                        operations,
+                        inputAlreadyFinished: inputAlreadyFinished
+                    )
                 }
             }
             terminationTask = createdTask
@@ -251,16 +276,21 @@ actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
         try await task.value
     }
 
-    private static func terminate(_ operations: Operations) async throws {
+    private static func terminate(
+        _ operations: Operations,
+        inputAlreadyFinished: Bool
+    ) async throws {
         var primaryError: (any Error)?
 
-        do {
-            try await operations.drainTail()
-        } catch {
-            primaryError = error
-        }
+        if !inputAlreadyFinished {
+            do {
+                try operations.drainTail()
+            } catch {
+                primaryError = error
+            }
 
-        operations.finishInput()
+            operations.finishInput()
+        }
 
         if primaryError == nil {
             do {

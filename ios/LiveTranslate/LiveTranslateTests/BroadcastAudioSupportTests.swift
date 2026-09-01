@@ -28,24 +28,28 @@ final class BroadcastAudioSupportTests: XCTestCase {
     }
 
     func testAsyncSendResumesWaitingProducersInFIFOOrder() async throws {
-        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        let suspendedSendPair = AsyncStream.makeStream(of: Int.self)
+        let suspendedSendContinuation = suspendedSendPair.continuation
+        let queue = BoundedAsyncQueue<Int>(
+            capacity: 1,
+            onSendSuspended: { value in
+                suspendedSendContinuation.yield(value)
+            }
+        )
+        var suspendedSends = suspendedSendPair.stream.makeAsyncIterator()
         try await queue.send(1)
 
-        let secondStarted = expectation(description: "second send started")
         let secondTask = Task {
-            secondStarted.fulfill()
             try await queue.send(2)
         }
-        await fulfillment(of: [secondStarted], timeout: 1)
-        await Task.yield()
+        let secondSuspendedValue = await suspendedSends.next()
+        XCTAssertEqual(secondSuspendedValue, 2)
 
-        let thirdStarted = expectation(description: "third send started")
         let thirdTask = Task {
-            thirdStarted.fulfill()
             try await queue.send(3)
         }
-        await fulfillment(of: [thirdStarted], timeout: 1)
-        await Task.yield()
+        let thirdSuspendedValue = await suspendedSends.next()
+        XCTAssertEqual(thirdSuspendedValue, 3)
 
         var iterator = queue.stream.makeAsyncIterator()
         let firstValue = await iterator.next()
@@ -59,16 +63,22 @@ final class BroadcastAudioSupportTests: XCTestCase {
     }
 
     func testFinishTerminatesBlockedSendAndDrainsAcceptedElements() async throws {
-        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        let suspendedSendPair = AsyncStream.makeStream(of: Int.self)
+        let suspendedSendContinuation = suspendedSendPair.continuation
+        let queue = BoundedAsyncQueue<Int>(
+            capacity: 1,
+            onSendSuspended: { value in
+                suspendedSendContinuation.yield(value)
+            }
+        )
+        var suspendedSends = suspendedSendPair.stream.makeAsyncIterator()
         try await queue.send(1)
 
-        let sendStarted = expectation(description: "blocked send started")
         let sendTask = Task {
-            sendStarted.fulfill()
             try await queue.send(2)
         }
-        await fulfillment(of: [sendStarted], timeout: 1)
-        await Task.yield()
+        let suspendedValue = await suspendedSends.next()
+        XCTAssertEqual(suspendedValue, 2)
 
         queue.finish()
 
@@ -116,16 +126,22 @@ final class BroadcastAudioSupportTests: XCTestCase {
     }
 
     func testCancellingBlockedSendDoesNotConsumeFutureCapacity() async throws {
-        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        let suspendedSendPair = AsyncStream.makeStream(of: Int.self)
+        let suspendedSendContinuation = suspendedSendPair.continuation
+        let queue = BoundedAsyncQueue<Int>(
+            capacity: 1,
+            onSendSuspended: { value in
+                suspendedSendContinuation.yield(value)
+            }
+        )
+        var suspendedSends = suspendedSendPair.stream.makeAsyncIterator()
         try await queue.send(1)
 
-        let sendStarted = expectation(description: "cancelled send started")
         let sendTask = Task {
-            sendStarted.fulfill()
             try await queue.send(2)
         }
-        await fulfillment(of: [sendStarted], timeout: 1)
-        await Task.yield()
+        let suspendedValue = await suspendedSends.next()
+        XCTAssertEqual(suspendedValue, 2)
 
         sendTask.cancel()
         do {
@@ -264,7 +280,7 @@ final class BroadcastAudioSupportTests: XCTestCase {
         )
     }
 
-    func testFinishWaitsForActiveAppendBeforeDrainingTail() async throws {
+    func testFinishClosesInputBeforeWaitingForActiveAppend() async throws {
         let operations = ControlledSpeechPipelineOperations(
             waitsForAppendRelease: true
         )
@@ -281,17 +297,43 @@ final class BroadcastAudioSupportTests: XCTestCase {
             try await lifecycle.finish()
         }
         await fulfillment(of: [finishInvocationStarted], timeout: 1)
-        try await Task.sleep(for: .milliseconds(50))
 
-        XCTAssertEqual(operations.events, [.append(1)])
+        let finishInputObserved = expectation(description: "finish input observed")
+        let finishInputObserver = Task {
+            await operations.waitUntilFinishInput()
+            finishInputObserved.fulfill()
+        }
+        await fulfillment(of: [finishInputObserved], timeout: 1)
+        XCTAssertEqual(operations.events, [.append(1), .finishInput])
 
         operations.releaseAppend()
         let appendedValue = try await appendTask.value
         XCTAssertEqual(appendedValue, 1)
         try await finishTask.value
+        await finishInputObserver.value
         XCTAssertEqual(
             operations.events,
-            [.append(1), .drainTail, .finishInput, .finalize, .cancelResults, .awaitResults]
+            [.append(1), .finishInput, .finalize, .cancelResults, .awaitResults]
+        )
+    }
+
+    func testTailBackpressureFailureStillCleansResources() async {
+        let operations = ControlledSpeechPipelineOperations(
+            drainError: .analyzerInputDropped
+        )
+        let lifecycle = SpeechPipelineLifecycle(operations: operations)
+
+        let error = await capturedError {
+            try await lifecycle.finish()
+        }
+
+        XCTAssertEqual(
+            error as? ControlledSpeechPipelineOperations.TestError,
+            .analyzerInputDropped
+        )
+        XCTAssertEqual(
+            operations.events,
+            [.drainTail, .finishInput, .cancelAnalyzer, .cancelResults, .awaitResults]
         )
     }
 
@@ -338,6 +380,7 @@ private final class ControlledSpeechPipelineOperations:
     @unchecked Sendable
 {
     enum TestError: Error, Equatable {
+        case analyzerInputDropped
         case drainFailed
     }
 
@@ -362,6 +405,8 @@ private final class ControlledSpeechPipelineOperations:
     private let appendStartedContinuation: AsyncStream<Void>.Continuation
     private let appendRelease: AsyncStream<Void>
     private let appendReleaseContinuation: AsyncStream<Void>.Continuation
+    private let finishInputObserved: AsyncStream<Void>
+    private let finishInputObservedContinuation: AsyncStream<Void>.Continuation
     private let finalizeStarted: AsyncStream<Void>
     private let finalizeStartedContinuation: AsyncStream<Void>.Continuation
     private let finalizeRelease: AsyncStream<Void>
@@ -386,6 +431,9 @@ private final class ControlledSpeechPipelineOperations:
         let appendReleasePair = AsyncStream.makeStream(of: Void.self)
         appendRelease = appendReleasePair.stream
         appendReleaseContinuation = appendReleasePair.continuation
+        let finishInputPair = AsyncStream.makeStream(of: Void.self)
+        finishInputObserved = finishInputPair.stream
+        finishInputObservedContinuation = finishInputPair.continuation
         let startedPair = AsyncStream.makeStream(of: Void.self)
         finalizeStarted = startedPair.stream
         finalizeStartedContinuation = startedPair.continuation
@@ -405,7 +453,7 @@ private final class ControlledSpeechPipelineOperations:
         return sample
     }
 
-    func drainTail() async throws {
+    func drainTail() throws {
         record(.drainTail)
         if let drainError {
             throw drainError
@@ -414,6 +462,7 @@ private final class ControlledSpeechPipelineOperations:
 
     func finishInput() {
         record(.finishInput)
+        finishInputObservedContinuation.yield()
     }
 
     func finalizeAnalyzer() async throws {
@@ -445,6 +494,12 @@ private final class ControlledSpeechPipelineOperations:
 
     func waitUntilAppendStarts() async {
         for await _ in appendStarted {
+            return
+        }
+    }
+
+    func waitUntilFinishInput() async {
+        for await _ in finishInputObserved {
             return
         }
     }
