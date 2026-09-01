@@ -5,36 +5,195 @@ enum BoundedAsyncQueueError: Error, Equatable {
     case terminated
 }
 
-final class BoundedAsyncQueue<Element: Sendable>: Sendable {
-    let stream: AsyncStream<Element>
+final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
+    struct Stream: AsyncSequence, Sendable {
+        typealias Element = Value
 
-    private let continuation: AsyncStream<Element>.Continuation
+        fileprivate let queue: BoundedAsyncQueue<Value>
+
+        func makeAsyncIterator() -> Iterator {
+            Iterator(queue: queue)
+        }
+    }
+
+    struct Iterator: AsyncIteratorProtocol {
+        fileprivate let queue: BoundedAsyncQueue<Value>
+
+        mutating func next() async -> Value? {
+            await queue.next()
+        }
+    }
+
+    var stream: Stream {
+        Stream(queue: self)
+    }
+
+    private struct PendingSender {
+        let id: UUID
+        let value: Value
+        let continuation: CheckedContinuation<Void, any Error>
+    }
+
+    private struct PendingReceiver {
+        let id: UUID
+        let continuation: CheckedContinuation<Value?, Never>
+    }
+
+    private enum NextAction {
+        case suspend
+        case resume(Value?)
+    }
+
+    private let capacity: Int
+    private let lock = NSLock()
+    private var bufferedValues: [Value] = []
+    private var pendingSenders: [PendingSender] = []
+    private var pendingReceivers: [PendingReceiver] = []
+    private var isFinished = false
 
     init(capacity: Int) {
         precondition(capacity > 0)
-        let pair = AsyncStream.makeStream(
-            of: Element.self,
-            bufferingPolicy: .bufferingOldest(capacity)
-        )
-        stream = pair.stream
-        continuation = pair.continuation
+        self.capacity = capacity
     }
 
-    func yield(_ element: Element) throws {
-        switch continuation.yield(element) {
-        case .enqueued:
-            return
-        case .dropped:
-            throw BoundedAsyncQueueError.dropped
-        case .terminated:
-            throw BoundedAsyncQueueError.terminated
-        @unknown default:
-            throw BoundedAsyncQueueError.terminated
+    func yield(_ value: Value) throws {
+        var receiver: CheckedContinuation<Value?, Never>?
+        try lock.withLock {
+            guard !isFinished else {
+                throw BoundedAsyncQueueError.terminated
+            }
+            if !pendingReceivers.isEmpty {
+                receiver = pendingReceivers.removeFirst().continuation
+            } else if bufferedValues.count < capacity && pendingSenders.isEmpty {
+                bufferedValues.append(value)
+            } else {
+                throw BoundedAsyncQueueError.dropped
+            }
+        }
+        receiver?.resume(returning: value)
+    }
+
+    func send(_ value: Value) async throws {
+        let id = UUID()
+        try Task.checkCancellation()
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                var receiver: CheckedContinuation<Value?, Never>?
+                var immediateError: (any Error)?
+                var didAccept = false
+                lock.withLock {
+                    if Task.isCancelled {
+                        immediateError = CancellationError()
+                    } else if isFinished {
+                        immediateError = BoundedAsyncQueueError.terminated
+                    } else if !pendingReceivers.isEmpty {
+                        receiver = pendingReceivers.removeFirst().continuation
+                        didAccept = true
+                    } else if bufferedValues.count < capacity && pendingSenders.isEmpty {
+                        bufferedValues.append(value)
+                        didAccept = true
+                    } else {
+                        pendingSenders.append(
+                            PendingSender(
+                                id: id,
+                                value: value,
+                                continuation: continuation
+                            )
+                        )
+                    }
+                }
+
+                if let immediateError {
+                    continuation.resume(throwing: immediateError)
+                } else if didAccept {
+                    receiver?.resume(returning: value)
+                    continuation.resume()
+                }
+            }
+        } onCancel: {
+            self.cancelSender(id: id)
         }
     }
 
     func finish() {
-        continuation.finish()
+        let waiters = lock.withLock {
+            guard !isFinished else {
+                return (senders: [PendingSender](), receivers: [PendingReceiver]())
+            }
+            isFinished = true
+            let waiters = (senders: pendingSenders, receivers: pendingReceivers)
+            pendingSenders.removeAll()
+            pendingReceivers.removeAll()
+            return waiters
+        }
+        waiters.senders.forEach {
+            $0.continuation.resume(throwing: BoundedAsyncQueueError.terminated)
+        }
+        waiters.receivers.forEach {
+            $0.continuation.resume(returning: nil)
+        }
+    }
+
+    private func next() async -> Value? {
+        let id = UUID()
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                var sender: PendingSender?
+                let action = lock.withLock { () -> NextAction in
+                    if Task.isCancelled {
+                        return .resume(nil)
+                    }
+                    if !bufferedValues.isEmpty {
+                        let value = bufferedValues.removeFirst()
+                        if !pendingSenders.isEmpty {
+                            let pendingSender = pendingSenders.removeFirst()
+                            sender = pendingSender
+                            bufferedValues.append(pendingSender.value)
+                        }
+                        return .resume(value)
+                    }
+                    if !pendingSenders.isEmpty {
+                        let pendingSender = pendingSenders.removeFirst()
+                        sender = pendingSender
+                        return .resume(pendingSender.value)
+                    }
+                    if isFinished {
+                        return .resume(nil)
+                    }
+                    pendingReceivers.append(
+                        PendingReceiver(id: id, continuation: continuation)
+                    )
+                    return .suspend
+                }
+
+                sender?.continuation.resume()
+                if case let .resume(value) = action {
+                    continuation.resume(returning: value)
+                }
+            }
+        } onCancel: {
+            self.cancelReceiver(id: id)
+        }
+    }
+
+    private func cancelSender(id: UUID) {
+        let continuation = lock.withLock {
+            guard let index = pendingSenders.firstIndex(where: { $0.id == id }) else {
+                return nil as CheckedContinuation<Void, any Error>?
+            }
+            return pendingSenders.remove(at: index).continuation
+        }
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    private func cancelReceiver(id: UUID) {
+        let continuation = lock.withLock {
+            guard let index = pendingReceivers.firstIndex(where: { $0.id == id }) else {
+                return nil as CheckedContinuation<Value?, Never>?
+            }
+            return pendingReceivers.remove(at: index).continuation
+        }
+        continuation?.resume(returning: nil)
     }
 }
 
@@ -46,8 +205,8 @@ protocol SpeechPipelineLifecycleOperations: Sendable {
     associatedtype Sample: Sendable
     associatedtype AppendResult: Sendable
 
-    func append(_ sample: Sample) throws -> AppendResult
-    func drainTail() throws
+    func append(_ sample: Sample) async throws -> AppendResult
+    func drainTail() async throws
     func finishInput()
     func finalizeAnalyzer() async throws
     func cancelAnalyzer() async
@@ -57,17 +216,21 @@ protocol SpeechPipelineLifecycleOperations: Sendable {
 
 actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
     private let operations: Operations
+    private let serialExecutor = AsyncSerialExecutor()
     private var terminationTask: Task<Void, any Error>?
 
     init(operations: Operations) {
         self.operations = operations
     }
 
-    func append(_ sample: Operations.Sample) throws -> Operations.AppendResult {
+    func append(_ sample: Operations.Sample) async throws -> Operations.AppendResult {
         guard terminationTask == nil else {
             throw SpeechPipelineLifecycleError.finished
         }
-        return try operations.append(sample)
+        let operations = self.operations
+        return try await serialExecutor.run {
+            try await operations.append(sample)
+        }
     }
 
     func finish() async throws {
@@ -76,8 +239,11 @@ actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
             task = terminationTask
         } else {
             let operations = self.operations
+            let serialExecutor = self.serialExecutor
             let createdTask = Task<Void, any Error> {
-                try await Self.terminate(operations)
+                try await serialExecutor.run {
+                    try await Self.terminate(operations)
+                }
             }
             terminationTask = createdTask
             task = createdTask
@@ -89,7 +255,7 @@ actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
         var primaryError: (any Error)?
 
         do {
-            try operations.drainTail()
+            try await operations.drainTail()
         } catch {
             primaryError = error
         }

@@ -53,10 +53,10 @@ private final class SpeechPipelineRuntime:
         self.resultsTask = resultsTask
     }
 
-    func append(_ request: SpeechPipelineAppendRequest) throws -> Bool {
+    func append(_ request: SpeechPipelineAppendRequest) async throws -> Bool {
         let buffer = try converter.convert(request.sample.buffer)
         if buffer.frameLength > 0 {
-            try yieldToAnalyzer(buffer)
+            try await sendToAnalyzer(buffer)
         }
         return buffer.frameLength > 0
             && AudioPCMConverter.hasAudibleEnergy(
@@ -65,9 +65,9 @@ private final class SpeechPipelineRuntime:
             )
     }
 
-    func drainTail() throws {
+    func drainTail() async throws {
         for buffer in try converter.finish() where buffer.frameLength > 0 {
-            try yieldToAnalyzer(buffer)
+            try await sendToAnalyzer(buffer)
         }
     }
 
@@ -91,9 +91,9 @@ private final class SpeechPipelineRuntime:
         try await resultsTask.value
     }
 
-    private func yieldToAnalyzer(_ buffer: AVAudioPCMBuffer) throws {
+    private func sendToAnalyzer(_ buffer: AVAudioPCMBuffer) async throws {
         do {
-            try inputQueue.yield(AnalyzerInput(buffer: buffer))
+            try await inputQueue.send(AnalyzerInput(buffer: buffer))
         } catch BoundedAsyncQueueError.dropped {
             throw SpeechPipelineError.analyzerInputDropped
         } catch BoundedAsyncQueueError.terminated {

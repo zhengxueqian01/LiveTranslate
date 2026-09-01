@@ -3,6 +3,148 @@ import XCTest
 @testable import LiveTranslate
 
 final class BroadcastAudioSupportTests: XCTestCase {
+    func testAsyncSendWaitsForCapacityBeforeCompleting() async throws {
+        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        try await queue.send(1)
+
+        let sendStarted = expectation(description: "send started")
+        let sendFinished = expectation(description: "send finished")
+        sendFinished.isInverted = true
+        let sendTask = Task {
+            sendStarted.fulfill()
+            try await queue.send(2)
+            sendFinished.fulfill()
+        }
+
+        await fulfillment(of: [sendStarted], timeout: 1)
+        await fulfillment(of: [sendFinished], timeout: 0.05)
+
+        var iterator = queue.stream.makeAsyncIterator()
+        let firstValue = await iterator.next()
+        XCTAssertEqual(firstValue, 1)
+        try await sendTask.value
+        let secondValue = await iterator.next()
+        XCTAssertEqual(secondValue, 2)
+    }
+
+    func testAsyncSendResumesWaitingProducersInFIFOOrder() async throws {
+        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        try await queue.send(1)
+
+        let secondStarted = expectation(description: "second send started")
+        let secondTask = Task {
+            secondStarted.fulfill()
+            try await queue.send(2)
+        }
+        await fulfillment(of: [secondStarted], timeout: 1)
+        await Task.yield()
+
+        let thirdStarted = expectation(description: "third send started")
+        let thirdTask = Task {
+            thirdStarted.fulfill()
+            try await queue.send(3)
+        }
+        await fulfillment(of: [thirdStarted], timeout: 1)
+        await Task.yield()
+
+        var iterator = queue.stream.makeAsyncIterator()
+        let firstValue = await iterator.next()
+        let secondValue = await iterator.next()
+        let thirdValue = await iterator.next()
+        XCTAssertEqual(firstValue, 1)
+        XCTAssertEqual(secondValue, 2)
+        XCTAssertEqual(thirdValue, 3)
+        try await secondTask.value
+        try await thirdTask.value
+    }
+
+    func testFinishTerminatesBlockedSendAndDrainsAcceptedElements() async throws {
+        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        try await queue.send(1)
+
+        let sendStarted = expectation(description: "blocked send started")
+        let sendTask = Task {
+            sendStarted.fulfill()
+            try await queue.send(2)
+        }
+        await fulfillment(of: [sendStarted], timeout: 1)
+        await Task.yield()
+
+        queue.finish()
+
+        do {
+            try await sendTask.value
+            XCTFail("A send waiting for capacity must terminate on finish")
+        } catch {
+            XCTAssertEqual(error as? BoundedAsyncQueueError, .terminated)
+        }
+
+        var iterator = queue.stream.makeAsyncIterator()
+        let acceptedValue = await iterator.next()
+        let terminalValue = await iterator.next()
+        XCTAssertEqual(acceptedValue, 1)
+        XCTAssertNil(terminalValue)
+
+        do {
+            try await queue.send(3)
+            XCTFail("A finished queue must reject future sends")
+        } catch {
+            XCTAssertEqual(error as? BoundedAsyncQueueError, .terminated)
+        }
+    }
+
+    func testFinishWakesBlockedConsumer() async {
+        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        let nextStarted = expectation(description: "next started")
+        let nextFinished = expectation(description: "next finished")
+        let nextTask = Task { () -> Int? in
+            var iterator = queue.stream.makeAsyncIterator()
+            nextStarted.fulfill()
+            let value = await iterator.next()
+            nextFinished.fulfill()
+            return value
+        }
+        await fulfillment(of: [nextStarted], timeout: 1)
+        await Task.yield()
+
+        queue.finish()
+
+        await fulfillment(of: [nextFinished], timeout: 1)
+        nextTask.cancel()
+        let value = await nextTask.value
+        XCTAssertNil(value)
+    }
+
+    func testCancellingBlockedSendDoesNotConsumeFutureCapacity() async throws {
+        let queue = BoundedAsyncQueue<Int>(capacity: 1)
+        try await queue.send(1)
+
+        let sendStarted = expectation(description: "cancelled send started")
+        let sendTask = Task {
+            sendStarted.fulfill()
+            try await queue.send(2)
+        }
+        await fulfillment(of: [sendStarted], timeout: 1)
+        await Task.yield()
+
+        sendTask.cancel()
+        do {
+            try await sendTask.value
+            XCTFail("A cancelled send must not remain suspended")
+        } catch is CancellationError {
+            // Expected.
+        } catch {
+            XCTFail("Expected CancellationError, got \(error)")
+        }
+
+        var iterator = queue.stream.makeAsyncIterator()
+        let firstValue = await iterator.next()
+        XCTAssertEqual(firstValue, 1)
+        try await queue.send(3)
+        let nextValue = await iterator.next()
+        XCTAssertEqual(nextValue, 3)
+    }
+
     func testBoundedQueuePreservesFIFOAndRejectsOverflow() async throws {
         let queue = BoundedAsyncQueue<Int>(capacity: 2)
 
@@ -122,6 +264,37 @@ final class BroadcastAudioSupportTests: XCTestCase {
         )
     }
 
+    func testFinishWaitsForActiveAppendBeforeDrainingTail() async throws {
+        let operations = ControlledSpeechPipelineOperations(
+            waitsForAppendRelease: true
+        )
+        let lifecycle = SpeechPipelineLifecycle(operations: operations)
+
+        let appendTask = Task {
+            try await lifecycle.append(1)
+        }
+        await operations.waitUntilAppendStarts()
+
+        let finishInvocationStarted = expectation(description: "finish invoked")
+        let finishTask = Task {
+            finishInvocationStarted.fulfill()
+            try await lifecycle.finish()
+        }
+        await fulfillment(of: [finishInvocationStarted], timeout: 1)
+        try await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(operations.events, [.append(1)])
+
+        operations.releaseAppend()
+        let appendedValue = try await appendTask.value
+        XCTAssertEqual(appendedValue, 1)
+        try await finishTask.value
+        XCTAssertEqual(
+            operations.events,
+            [.append(1), .drainTail, .finishInput, .finalize, .cancelResults, .awaitResults]
+        )
+    }
+
     func testFinishFailureStillCleansResourcesAndRepeatedFinishIsIdempotent() async {
         let operations = ControlledSpeechPipelineOperations(drainError: .drainFailed)
         let lifecycle = SpeechPipelineLifecycle(operations: operations)
@@ -183,7 +356,12 @@ private final class ControlledSpeechPipelineOperations:
 
     private let lock = NSLock()
     private let drainError: TestError?
+    private let waitsForAppendRelease: Bool
     private let waitsForFinalizeRelease: Bool
+    private let appendStarted: AsyncStream<Void>
+    private let appendStartedContinuation: AsyncStream<Void>.Continuation
+    private let appendRelease: AsyncStream<Void>
+    private let appendReleaseContinuation: AsyncStream<Void>.Continuation
     private let finalizeStarted: AsyncStream<Void>
     private let finalizeStartedContinuation: AsyncStream<Void>.Continuation
     private let finalizeRelease: AsyncStream<Void>
@@ -196,10 +374,18 @@ private final class ControlledSpeechPipelineOperations:
 
     init(
         drainError: TestError? = nil,
+        waitsForAppendRelease: Bool = false,
         waitsForFinalizeRelease: Bool = false
     ) {
         self.drainError = drainError
+        self.waitsForAppendRelease = waitsForAppendRelease
         self.waitsForFinalizeRelease = waitsForFinalizeRelease
+        let appendStartedPair = AsyncStream.makeStream(of: Void.self)
+        appendStarted = appendStartedPair.stream
+        appendStartedContinuation = appendStartedPair.continuation
+        let appendReleasePair = AsyncStream.makeStream(of: Void.self)
+        appendRelease = appendReleasePair.stream
+        appendReleaseContinuation = appendReleasePair.continuation
         let startedPair = AsyncStream.makeStream(of: Void.self)
         finalizeStarted = startedPair.stream
         finalizeStartedContinuation = startedPair.continuation
@@ -208,12 +394,18 @@ private final class ControlledSpeechPipelineOperations:
         finalizeReleaseContinuation = releasePair.continuation
     }
 
-    func append(_ sample: Int) throws -> Int {
+    func append(_ sample: Int) async throws -> Int {
         record(.append(sample))
+        appendStartedContinuation.yield()
+        if waitsForAppendRelease {
+            for await _ in appendRelease {
+                break
+            }
+        }
         return sample
     }
 
-    func drainTail() throws {
+    func drainTail() async throws {
         record(.drainTail)
         if let drainError {
             throw drainError
@@ -249,6 +441,17 @@ private final class ControlledSpeechPipelineOperations:
         for await _ in finalizeStarted {
             return
         }
+    }
+
+    func waitUntilAppendStarts() async {
+        for await _ in appendStarted {
+            return
+        }
+    }
+
+    func releaseAppend() {
+        appendReleaseContinuation.yield()
+        appendReleaseContinuation.finish()
     }
 
     func releaseFinalize() {
