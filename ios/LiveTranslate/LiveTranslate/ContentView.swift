@@ -11,12 +11,15 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var viewModel: AppViewModel
     @State private var translationConfiguration: TranslationSession.Configuration?
+    @State private var translationSourceLanguage: SourceLanguage = .english
 
     init(viewModel: AppViewModel? = nil) {
         _viewModel = StateObject(wrappedValue: viewModel ?? AppViewModel.live())
     }
 
     var body: some View {
+        let sourceLanguage = translationSourceLanguage
+
         NavigationStack {
             Form {
                 Section("输入语言") {
@@ -85,11 +88,11 @@ struct ContentView: View {
                 do {
                     try await session.prepareTranslation()
                     await MainActor.run {
-                        viewModel.markTranslationReady()
+                        viewModel.markTranslationReady(for: sourceLanguage)
                     }
                 } catch {
                     await MainActor.run {
-                        viewModel.reportTranslationError(error)
+                        viewModel.reportTranslationError(error, for: sourceLanguage)
                     }
                 }
             }
@@ -112,15 +115,17 @@ struct ContentView: View {
     }
 
     private func configureTranslation() {
+        let sourceLanguage = viewModel.selectedLanguage
+        translationSourceLanguage = sourceLanguage
         if #available(iOS 26.4, *) {
             translationConfiguration = TranslationSession.Configuration(
-                source: viewModel.selectedLanguage.translationSource,
+                source: sourceLanguage.translationSource,
                 target: SourceLanguage.translationTarget,
                 preferredStrategy: .lowLatency
             )
         } else {
             translationConfiguration = TranslationSession.Configuration(
-                source: viewModel.selectedLanguage.translationSource,
+                source: sourceLanguage.translationSource,
                 target: SourceLanguage.translationTarget
             )
         }

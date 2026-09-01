@@ -17,7 +17,11 @@ protocol ModelPreparing: Sendable {
 
 @MainActor
 final class AppViewModel: ObservableObject {
-    @Published var selectedLanguage: SourceLanguage = .english
+    @Published var selectedLanguage: SourceLanguage {
+        didSet {
+            languageStore?.save(selectedLanguage)
+        }
+    }
     @Published private(set) var speechStatus: ModelResourceStatus = .unknown
     @Published private(set) var isTranslationReady = false
     @Published private(set) var latestSnapshot: CaptionSnapshot?
@@ -25,64 +29,118 @@ final class AppViewModel: ObservableObject {
 
     private let modelService: any ModelPreparing
     private let store: (any CaptionStoreProtocol)?
+    private let languageStore: SourceLanguageStore?
+    private let storageErrorMessage: String?
+    private var speechErrorMessage: String?
+    private var translationErrorMessage: String?
+    private var captionErrorMessage: String?
 
     var canStartBroadcast: Bool {
-        speechStatus == .installed && isTranslationReady && errorMessage == nil
+        store != nil && speechStatus == .installed && isTranslationReady && errorMessage == nil
     }
 
-    init(modelService: any ModelPreparing, store: any CaptionStoreProtocol) {
+    init(
+        modelService: any ModelPreparing,
+        store: (any CaptionStoreProtocol)?,
+        languageStore: SourceLanguageStore
+    ) {
         self.modelService = modelService
         self.store = store
+        self.languageStore = languageStore
+        storageErrorMessage = store == nil
+            ? "无法打开 App Group，请检查两个 Target 的签名与 App Group 配置。"
+            : nil
+        speechErrorMessage = nil
+        translationErrorMessage = nil
+        captionErrorMessage = nil
+        selectedLanguage = languageStore.load() ?? .english
+        errorMessage = storageErrorMessage
     }
 
     private init(modelService: any ModelPreparing, errorMessage: String) {
         self.modelService = modelService
         store = nil
+        languageStore = nil
+        storageErrorMessage = errorMessage
+        speechErrorMessage = nil
+        translationErrorMessage = nil
+        captionErrorMessage = nil
+        selectedLanguage = .english
         self.errorMessage = errorMessage
     }
 
     static func live() -> AppViewModel {
-        do {
-            return AppViewModel(
-                modelService: ModelPreparationService(),
-                store: try CaptionStore()
-            )
-        } catch {
+        guard let defaults = UserDefaults(suiteName: CaptionStore.appGroupIdentifier) else {
             return AppViewModel(
                 modelService: ModelPreparationService(),
                 errorMessage: "无法打开 App Group，请检查两个 Target 的签名与 App Group 配置。"
             )
         }
+        return AppViewModel(
+            modelService: ModelPreparationService(),
+            store: CaptionStore(defaults: defaults),
+            languageStore: SourceLanguageStore(defaults: defaults)
+        )
     }
 
     func refreshModelStatus() async {
-        speechStatus = await modelService.speechStatus(for: selectedLanguage)
+        let source = selectedLanguage
+        let status = await modelService.speechStatus(for: source)
+        guard source == selectedLanguage else {
+            return
+        }
+        speechStatus = status
     }
 
     func installSpeechModel() async {
+        let source = selectedLanguage
         speechStatus = .downloading
-        errorMessage = nil
+        speechErrorMessage = nil
+        refreshErrorMessage()
         do {
-            try await modelService.installSpeechModel(for: selectedLanguage)
+            try await modelService.installSpeechModel(for: source)
+            guard source == selectedLanguage else {
+                return
+            }
             await refreshModelStatus()
         } catch {
+            guard source == selectedLanguage else {
+                return
+            }
             speechStatus = .needsDownload
-            errorMessage = "语音模型下载失败：\(error.localizedDescription)"
+            speechErrorMessage = "语音模型下载失败：\(error.localizedDescription)"
+            refreshErrorMessage()
         }
     }
 
-    func markTranslationReady() {
+    func markTranslationReady(for source: SourceLanguage) {
+        guard source == selectedLanguage else {
+            return
+        }
         isTranslationReady = true
-        errorMessage = nil
+        translationErrorMessage = nil
+        refreshErrorMessage()
+    }
+
+    func markTranslationReady() {
+        markTranslationReady(for: selectedLanguage)
     }
 
     func markTranslationNeedsPreparation() {
         isTranslationReady = false
     }
 
-    func reportTranslationError(_ error: any Error) {
+    func reportTranslationError(_ error: any Error, for source: SourceLanguage) {
+        guard source == selectedLanguage else {
+            return
+        }
         isTranslationReady = false
-        errorMessage = "翻译模型准备失败：\(error.localizedDescription)"
+        translationErrorMessage = "翻译模型准备失败：\(error.localizedDescription)"
+        refreshErrorMessage()
+    }
+
+    func reportTranslationError(_ error: any Error) {
+        reportTranslationError(error, for: selectedLanguage)
     }
 
     func refreshCaption() {
@@ -92,7 +150,15 @@ final class AppViewModel: ObservableObject {
         do {
             latestSnapshot = try store.load()
         } catch {
-            errorMessage = "字幕状态读取失败：\(error.localizedDescription)"
+            captionErrorMessage = "字幕状态读取失败：\(error.localizedDescription)"
+            refreshErrorMessage()
         }
+    }
+
+    private func refreshErrorMessage() {
+        errorMessage = storageErrorMessage
+            ?? captionErrorMessage
+            ?? speechErrorMessage
+            ?? translationErrorMessage
     }
 }
