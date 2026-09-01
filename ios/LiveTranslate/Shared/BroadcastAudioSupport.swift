@@ -45,6 +45,7 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
     }
 
     private let capacity: Int
+    private let maximumBufferedValueCount: Int
     private let onSendSuspended: (@Sendable (Value) -> Void)?
     private let lock = NSLock()
     private var bufferedValues: [Value] = []
@@ -54,10 +55,14 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
 
     init(
         capacity: Int,
+        reservedCapacity: Int = 0,
         onSendSuspended: (@Sendable (Value) -> Void)? = nil
     ) {
         precondition(capacity > 0)
+        precondition(reservedCapacity >= 0)
+        precondition(capacity <= Int.max - reservedCapacity)
         self.capacity = capacity
+        maximumBufferedValueCount = capacity + reservedCapacity
         self.onSendSuspended = onSendSuspended
     }
 
@@ -70,6 +75,24 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
             if !pendingReceivers.isEmpty {
                 receiver = pendingReceivers.removeFirst().continuation
             } else if bufferedValues.count < capacity && pendingSenders.isEmpty {
+                bufferedValues.append(value)
+            } else {
+                throw BoundedAsyncQueueError.dropped
+            }
+        }
+        receiver?.resume(returning: value)
+    }
+
+    func yieldReserved(_ value: Value) throws {
+        var receiver: CheckedContinuation<Value?, Never>?
+        try lock.withLock {
+            guard !isFinished else {
+                throw BoundedAsyncQueueError.terminated
+            }
+            if !pendingReceivers.isEmpty {
+                receiver = pendingReceivers.removeFirst().continuation
+            } else if pendingSenders.isEmpty
+                        && bufferedValues.count < maximumBufferedValueCount {
                 bufferedValues.append(value)
             } else {
                 throw BoundedAsyncQueueError.dropped
@@ -154,7 +177,8 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
                     }
                     if !bufferedValues.isEmpty {
                         let value = bufferedValues.removeFirst()
-                        if !pendingSenders.isEmpty {
+                        if bufferedValues.count < capacity,
+                           !pendingSenders.isEmpty {
                             let pendingSender = pendingSenders.removeFirst()
                             sender = pendingSender
                             bufferedValues.append(pendingSender.value)
@@ -204,6 +228,11 @@ final class BoundedAsyncQueue<Value: Sendable>: @unchecked Sendable {
         }
         continuation?.resume(returning: nil)
     }
+}
+
+enum SpeechAnalyzerInputBufferLimits {
+    static let regularCapacity = 8
+    static let tailReserveCapacity = AudioPCMConverter.maximumTailOutputBufferCount
 }
 
 enum SpeechPipelineLifecycleError: Error, Equatable {

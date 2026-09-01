@@ -67,7 +67,7 @@ private final class SpeechPipelineRuntime:
 
     func drainTail() throws {
         for buffer in try converter.finish() where buffer.frameLength > 0 {
-            try yieldToAnalyzer(buffer)
+            try yieldTailToAnalyzer(buffer)
         }
     }
 
@@ -101,9 +101,9 @@ private final class SpeechPipelineRuntime:
         }
     }
 
-    private func yieldToAnalyzer(_ buffer: AVAudioPCMBuffer) throws {
+    private func yieldTailToAnalyzer(_ buffer: AVAudioPCMBuffer) throws {
         do {
-            try inputQueue.yield(AnalyzerInput(buffer: buffer))
+            try inputQueue.yieldReserved(AnalyzerInput(buffer: buffer))
         } catch BoundedAsyncQueueError.dropped {
             throw SpeechPipelineError.analyzerInputDropped
         } catch BoundedAsyncQueueError.terminated {
@@ -113,8 +113,6 @@ private final class SpeechPipelineRuntime:
 }
 
 actor SpeechPipeline {
-    private static let analyzerInputCapacity = 8
-
     private let lifecycle: SpeechPipelineLifecycle<SpeechPipelineRuntime>
 
     private init(lifecycle: SpeechPipelineLifecycle<SpeechPipelineRuntime>) {
@@ -139,7 +137,8 @@ actor SpeechPipeline {
 
         let analyzer = SpeechAnalyzer(modules: modules)
         let inputQueue = BoundedAsyncQueue<AnalyzerInput>(
-            capacity: analyzerInputCapacity
+            capacity: SpeechAnalyzerInputBufferLimits.regularCapacity,
+            reservedCapacity: SpeechAnalyzerInputBufferLimits.tailReserveCapacity
         )
         let resultsTask = Task<Void, any Error> {
             do {

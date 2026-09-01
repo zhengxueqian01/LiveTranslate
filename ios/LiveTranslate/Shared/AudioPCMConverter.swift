@@ -78,6 +78,8 @@ enum AudioPCMConverterError: LocalizedError {
 }
 
 final class AudioPCMConverter {
+    static let maximumTailOutputBufferCount = 32
+
     let outputFormat: AVAudioFormat
 
     private var converter: AVAudioConverter?
@@ -126,7 +128,7 @@ final class AudioPCMConverter {
         guard let converter else { return [] }
 
         var outputs: [AVAudioPCMBuffer] = []
-        for _ in 0..<32 {
+        for _ in 0..<Self.maximumTailOutputBufferCount {
             guard let outputBuffer = AVAudioPCMBuffer(
                 pcmFormat: outputFormat,
                 frameCapacity: AVAudioFrameCount(max(1_024, Int(outputFormat.sampleRate / 10)))

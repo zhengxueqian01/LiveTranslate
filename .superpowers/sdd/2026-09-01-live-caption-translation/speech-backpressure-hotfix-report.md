@@ -2,11 +2,11 @@
 
 ## Status
 
-Implemented bounded async backpressure for the SpeechAnalyzer input path. The ReplayKit ingress path retains its existing synchronous bounded/drop behavior, so sustained analyzer slowness still propagates pressure to the existing ingress queue rather than creating unbounded work. Fix Round 1 also makes termination close a blocked analyzer input before waiting for active append work and prevents converter-tail cleanup from suspending indefinitely on a full queue.
+Implemented bounded async backpressure for the SpeechAnalyzer input path. The ReplayKit ingress path retains its existing synchronous bounded/drop behavior, so sustained analyzer slowness still propagates pressure to the existing ingress queue rather than creating unbounded work. Fix Round 1 makes termination close a blocked analyzer input before waiting for active append work. Fix Round 2 separates the analyzer's regular capacity from a bounded converter-tail reserve, so graceful finish can preserve every possible converter tail buffer even when the regular queue is full.
 
 ## Root cause
 
-`SpeechPipelineRuntime` synchronously fed a capacity-8 `AsyncStream` queue. `AsyncStream.Continuation.yield` returns `.dropped` as soon as `bufferingOldest` is full, so a transient SpeechAnalyzer scheduling delay became `SpeechPipelineError.analyzerInputDropped` and terminated the broadcast. The queue had no producer suspension or consumption feedback.
+`SpeechPipelineRuntime` synchronously fed a capacity-8 `AsyncStream` queue. `AsyncStream.Continuation.yield` returns `.dropped` as soon as `bufferingOldest` is full, so a transient SpeechAnalyzer scheduling delay became `SpeechPipelineError.analyzerInputDropped` and terminated the broadcast. The queue had no producer suspension or consumption feedback. After Round 1 added async regular sends, graceful finish still synchronously placed converter tail into the same eight slots. A momentarily full regular queue therefore rejected tail immediately even though `AudioPCMConverter.finish()` has a finite, known maximum of 32 output buffers.
 
 ## Implementation
 
@@ -15,7 +15,9 @@ Implemented bounded async backpressure for the SpeechAnalyzer input path. The Re
 - Added async `send`: full queues suspend senders, consumption resumes them FIFO, cancellation removes the exact waiter, and `finish()` terminates blocked/future sends while draining accepted values.
 - `finish()` also resumes blocked consumers with end-of-sequence and remains idempotent.
 - Made SpeechPipeline append await analyzer capacity one buffer at a time.
-- Converter-tail drain now makes bounded synchronous queue attempts. A full queue immediately becomes localized `SpeechPipelineError.analyzerInputDropped` instead of suspending cleanup indefinitely.
+- Defined the converter's maximum tail output count once as `AudioPCMConverter.maximumTailOutputBufferCount = 32` and reused it as the finish-loop bound.
+- Split SpeechAnalyzer buffering into regular capacity 8 and converter-tail reserve 32. Regular async sends cannot enter the reserve; tail drain uses bounded synchronous reserved yields. Total buffered capacity is therefore bounded at 40.
+- Consumption promotes a blocked regular sender only after occupancy falls below the regular capacity, so regular traffic cannot invade tail reserve through the consumer path.
 - Serialized converter work through the existing `AsyncSerialExecutor`. When finish observes active or pending append work, it closes analyzer input immediately to wake blocked sends, then waits for serialized append work to exit before analyzer cleanup. With no append in flight, normal tail drain still runs before input finish.
 - Preserved analyzer finalization order and primary-error handling. Known queue errors still map to localized `SpeechPipelineError` cases.
 
@@ -58,7 +60,7 @@ Focused tests cover:
 - finish wake-up of a blocked consumer;
 - blocked-send cancellation without capacity leakage;
 - finish closing analyzer input before waiting for an active async append;
-- cleanup after converter-tail drain reports analyzer input backpressure.
+- cleanup after an injected converter-tail drain failure.
 
 ## Fix Round 1 evidence
 
@@ -92,16 +94,49 @@ Executed 15 tests, with 0 failures (0 unexpected)
 ** TEST SUCCEEDED **
 ```
 
+## Fix Round 2 evidence
+
+The new reserve contract was introduced test-first. Before the shared limits and reserved-capacity API existed, the focused suite failed to compile:
+
+```text
+cannot find 'SpeechAnalyzerInputBufferLimits' in scope
+extra argument 'reservedCapacity' in call
+** TEST FAILED **
+```
+
+The tests require all of the following:
+
+- regular async sends remain limited to eight values and cannot use tail reserve;
+- 32 reserved tail values fit behind eight regular values, preserving FIFO and the total bound of 40;
+- consuming a value while reserve remains occupied does not promote a blocked regular sender early;
+- graceful finish preserves all 32 tail values when the regular eight-slot capacity is full;
+- the Round 1 active-append termination path still closes input before waiting and skips tail drain.
+
+As a mutation check, restoring the old unconditional sender promotion produced the expected behavioral RED:
+
+```text
+A regular send must remain blocked while tail reserve is occupied
+Executed 1 test, with 1 failure
+** TEST FAILED **
+```
+
+After restoring the regular-capacity promotion gate, the focused suite was GREEN:
+
+```text
+Executed 18 tests, with 0 failures (0 unexpected)
+** TEST SUCCEEDED **
+```
+
 ## Verification
 
 Simulator destination: `7EC5843E-3F68-4EDF-874A-B87EFE0106B9`; all test commands used `-parallel-testing-enabled NO`.
 
 ```text
 BroadcastAudioSupportTests + AudioPCMConverterTests:
-Executed 17 tests, with 0 failures (0 unexpected)
+Executed 20 tests, with 0 failures (0 unexpected)
 
 Full LiveTranslateTests:
-Executed 46 tests, with 0 failures (0 unexpected)
+Executed 49 tests, with 0 failures (0 unexpected)
 
 iphoneos LiveTranslateBroadcast build, CODE_SIGNING_ALLOWED=NO:
 ** BUILD SUCCEEDED **
@@ -110,6 +145,7 @@ iphoneos LiveTranslateBroadcast build, CODE_SIGNING_ALLOWED=NO:
 ## Scoped files
 
 - `ios/LiveTranslate/Shared/BroadcastAudioSupport.swift`
+- `ios/LiveTranslate/Shared/AudioPCMConverter.swift`
 - `ios/LiveTranslate/LiveTranslateBroadcast/SpeechPipeline.swift`
 - `ios/LiveTranslate/LiveTranslateTests/BroadcastAudioSupportTests.swift`
 - this report

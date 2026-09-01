@@ -27,6 +27,36 @@ final class BroadcastAudioSupportTests: XCTestCase {
         XCTAssertEqual(secondValue, 2)
     }
 
+    func testAsyncSendCannotUseAnalyzerTailReserve() async throws {
+        let suspendedSendPair = AsyncStream.makeStream(of: Int.self)
+        let suspendedSendContinuation = suspendedSendPair.continuation
+        let queue = BoundedAsyncQueue<Int>(
+            capacity: SpeechAnalyzerInputBufferLimits.regularCapacity,
+            reservedCapacity: SpeechAnalyzerInputBufferLimits.tailReserveCapacity,
+            onSendSuspended: { value in
+                suspendedSendContinuation.yield(value)
+            }
+        )
+        var suspendedSends = suspendedSendPair.stream.makeAsyncIterator()
+        for value in 0..<8 {
+            try await queue.send(value)
+        }
+
+        let blockedSend = Task {
+            try await queue.send(8)
+        }
+        let suspendedValue = await suspendedSends.next()
+        XCTAssertEqual(suspendedValue, 8)
+
+        queue.finish()
+        do {
+            try await blockedSend.value
+            XCTFail("A regular send must not use analyzer tail reserve")
+        } catch {
+            XCTAssertEqual(error as? BoundedAsyncQueueError, .terminated)
+        }
+    }
+
     func testAsyncSendResumesWaitingProducersInFIFOOrder() async throws {
         let suspendedSendPair = AsyncStream.makeStream(of: Int.self)
         let suspendedSendContinuation = suspendedSendPair.continuation
@@ -178,6 +208,64 @@ final class BroadcastAudioSupportTests: XCTestCase {
         XCTAssertEqual(values, [1, 2])
     }
 
+    func testAnalyzerTailReservePreservesFortyValueBoundAndFIFO() async throws {
+        let queue = BoundedAsyncQueue<Int>(
+            capacity: SpeechAnalyzerInputBufferLimits.regularCapacity,
+            reservedCapacity: SpeechAnalyzerInputBufferLimits.tailReserveCapacity
+        )
+
+        for value in 0..<8 {
+            try queue.yield(value)
+        }
+        for value in 8..<40 {
+            try queue.yieldReserved(value)
+        }
+        XCTAssertThrowsError(try queue.yieldReserved(40)) { error in
+            XCTAssertEqual(error as? BoundedAsyncQueueError, .dropped)
+        }
+        queue.finish()
+
+        var values: [Int] = []
+        for await value in queue.stream {
+            values.append(value)
+        }
+        XCTAssertEqual(values, Array(0..<40))
+    }
+
+    func testConsumingTailReserveDoesNotPromoteBlockedRegularSendEarly() async throws {
+        let suspendedSendPair = AsyncStream.makeStream(of: Int.self)
+        let suspendedSendContinuation = suspendedSendPair.continuation
+        let queue = BoundedAsyncQueue<Int>(
+            capacity: 1,
+            reservedCapacity: 2,
+            onSendSuspended: { value in
+                suspendedSendContinuation.yield(value)
+            }
+        )
+        var suspendedSends = suspendedSendPair.stream.makeAsyncIterator()
+        try queue.yield(1)
+        try queue.yieldReserved(2)
+        try queue.yieldReserved(3)
+
+        let blockedSend = Task {
+            try await queue.send(4)
+        }
+        let suspendedValue = await suspendedSends.next()
+        XCTAssertEqual(suspendedValue, 4)
+
+        var iterator = queue.stream.makeAsyncIterator()
+        let firstValue = await iterator.next()
+        XCTAssertEqual(firstValue, 1)
+        queue.finish()
+
+        do {
+            try await blockedSend.value
+            XCTFail("A regular send must remain blocked while tail reserve is occupied")
+        } catch {
+            XCTAssertEqual(error as? BoundedAsyncQueueError, .terminated)
+        }
+    }
+
     func testBoundedQueueRejectsYieldAfterFinish() {
         let queue = BoundedAsyncQueue<Int>(capacity: 1)
 
@@ -317,23 +405,23 @@ final class BroadcastAudioSupportTests: XCTestCase {
         )
     }
 
-    func testTailBackpressureFailureStillCleansResources() async {
-        let operations = ControlledSpeechPipelineOperations(
-            drainError: .analyzerInputDropped
+    func testGracefulFinishPreservesTailWhenAnalyzerRegularCapacityIsFull() async throws {
+        let operations = QueueBackedSpeechPipelineOperations(
+            tailValues: Array(8..<40)
         )
         let lifecycle = SpeechPipelineLifecycle(operations: operations)
 
-        let error = await capturedError {
-            try await lifecycle.finish()
+        for value in 0..<8 {
+            let appendedValue = try await lifecycle.append(value)
+            XCTAssertEqual(appendedValue, value)
         }
+        try await lifecycle.finish()
 
-        XCTAssertEqual(
-            error as? ControlledSpeechPipelineOperations.TestError,
-            .analyzerInputDropped
-        )
+        let values = await operations.acceptedValues()
+        XCTAssertEqual(values, Array(0..<40))
         XCTAssertEqual(
             operations.events,
-            [.drainTail, .finishInput, .cancelAnalyzer, .cancelResults, .awaitResults]
+            [.drainTail, .finishInput, .finalize, .cancelResults, .awaitResults]
         )
     }
 
@@ -380,7 +468,6 @@ private final class ControlledSpeechPipelineOperations:
     @unchecked Sendable
 {
     enum TestError: Error, Equatable {
-        case analyzerInputDropped
         case drainFailed
     }
 
@@ -512,6 +599,86 @@ private final class ControlledSpeechPipelineOperations:
     func releaseFinalize() {
         finalizeReleaseContinuation.yield()
         finalizeReleaseContinuation.finish()
+    }
+
+    private func record(_ event: Event) {
+        lock.withLock {
+            recordedEvents.append(event)
+        }
+    }
+}
+
+private final class QueueBackedSpeechPipelineOperations:
+    SpeechPipelineLifecycleOperations,
+    @unchecked Sendable
+{
+    enum Event: Equatable {
+        case drainTail
+        case finishInput
+        case finalize
+        case cancelAnalyzer
+        case cancelResults
+        case awaitResults
+    }
+
+    typealias Sample = Int
+    typealias AppendResult = Int
+
+    private let queue = BoundedAsyncQueue<Int>(
+        capacity: SpeechAnalyzerInputBufferLimits.regularCapacity,
+        reservedCapacity: SpeechAnalyzerInputBufferLimits.tailReserveCapacity
+    )
+    private let tailValues: [Int]
+    private let lock = NSLock()
+    private var recordedEvents: [Event] = []
+
+    var events: [Event] {
+        lock.withLock { recordedEvents }
+    }
+
+    init(tailValues: [Int]) {
+        self.tailValues = tailValues
+    }
+
+    func append(_ sample: Int) async throws -> Int {
+        try await queue.send(sample)
+        return sample
+    }
+
+    func drainTail() throws {
+        record(.drainTail)
+        for value in tailValues {
+            try queue.yieldReserved(value)
+        }
+    }
+
+    func finishInput() {
+        record(.finishInput)
+        queue.finish()
+    }
+
+    func finalizeAnalyzer() async throws {
+        record(.finalize)
+    }
+
+    func cancelAnalyzer() async {
+        record(.cancelAnalyzer)
+    }
+
+    func cancelResults() {
+        record(.cancelResults)
+    }
+
+    func awaitResults() async throws {
+        record(.awaitResults)
+    }
+
+    func acceptedValues() async -> [Int] {
+        var values: [Int] = []
+        for await value in queue.stream {
+            values.append(value)
+        }
+        return values
     }
 
     private func record(_ event: Event) {
