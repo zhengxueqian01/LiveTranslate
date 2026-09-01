@@ -24,16 +24,24 @@ enum SpeechPipelineError: LocalizedError {
     }
 }
 
-actor SpeechPipeline {
-    private static let analyzerInputCapacity = 8
+private struct SpeechPipelineAppendRequest: Sendable {
+    let sample: CapturedAudioSample
+    let audibleThreshold: Float
+}
+
+private final class SpeechPipelineRuntime:
+    SpeechPipelineLifecycleOperations,
+    @unchecked Sendable
+{
+    typealias Sample = SpeechPipelineAppendRequest
+    typealias AppendResult = Bool
 
     private let analyzer: SpeechAnalyzer
     private let converter: AudioPCMConverter
     private let inputQueue: BoundedAsyncQueue<AnalyzerInput>
     private let resultsTask: Task<Void, any Error>
-    private var isFinished = false
 
-    private init(
+    init(
         analyzer: SpeechAnalyzer,
         converter: AudioPCMConverter,
         inputQueue: BoundedAsyncQueue<AnalyzerInput>,
@@ -43,6 +51,64 @@ actor SpeechPipeline {
         self.converter = converter
         self.inputQueue = inputQueue
         self.resultsTask = resultsTask
+    }
+
+    func append(_ request: SpeechPipelineAppendRequest) throws -> Bool {
+        let buffer = try converter.convert(request.sample.buffer)
+        if buffer.frameLength > 0 {
+            try yieldToAnalyzer(buffer)
+        }
+        return buffer.frameLength > 0
+            && AudioPCMConverter.hasAudibleEnergy(
+                buffer,
+                threshold: request.audibleThreshold
+            )
+    }
+
+    func drainTail() throws {
+        for buffer in try converter.finish() where buffer.frameLength > 0 {
+            try yieldToAnalyzer(buffer)
+        }
+    }
+
+    func finishInput() {
+        inputQueue.finish()
+    }
+
+    func finalizeAnalyzer() async throws {
+        try await analyzer.finalizeAndFinishThroughEndOfInput()
+    }
+
+    func cancelAnalyzer() async {
+        await analyzer.cancelAndFinishNow()
+    }
+
+    func cancelResults() {
+        resultsTask.cancel()
+    }
+
+    func awaitResults() async throws {
+        try await resultsTask.value
+    }
+
+    private func yieldToAnalyzer(_ buffer: AVAudioPCMBuffer) throws {
+        do {
+            try inputQueue.yield(AnalyzerInput(buffer: buffer))
+        } catch BoundedAsyncQueueError.dropped {
+            throw SpeechPipelineError.analyzerInputDropped
+        } catch BoundedAsyncQueueError.terminated {
+            throw SpeechPipelineError.finished
+        }
+    }
+}
+
+actor SpeechPipeline {
+    private static let analyzerInputCapacity = 8
+
+    private let lifecycle: SpeechPipelineLifecycle<SpeechPipelineRuntime>
+
+    private init(lifecycle: SpeechPipelineLifecycle<SpeechPipelineRuntime>) {
+        self.lifecycle = lifecycle
     }
 
     static func start(
@@ -94,73 +160,35 @@ actor SpeechPipeline {
             throw error
         }
 
-        return SpeechPipeline(
+        let runtime = SpeechPipelineRuntime(
             analyzer: analyzer,
             converter: AudioPCMConverter(outputFormat: audioFormat),
             inputQueue: inputQueue,
             resultsTask: resultsTask
         )
+        return SpeechPipeline(
+            lifecycle: SpeechPipelineLifecycle(operations: runtime)
+        )
     }
 
     @discardableResult
-    func append(_ sample: CapturedAudioSample, audibleThreshold: Float) throws -> Bool {
-        guard !isFinished else {
+    func append(
+        _ sample: CapturedAudioSample,
+        audibleThreshold: Float
+    ) async throws -> Bool {
+        do {
+            return try await lifecycle.append(
+                SpeechPipelineAppendRequest(
+                    sample: sample,
+                    audibleThreshold: audibleThreshold
+                )
+            )
+        } catch SpeechPipelineLifecycleError.finished {
             throw SpeechPipelineError.finished
         }
-        let buffer = try converter.convert(sample.buffer)
-        if buffer.frameLength > 0 {
-            try yieldToAnalyzer(buffer)
-        }
-        return buffer.frameLength > 0
-            && AudioPCMConverter.hasAudibleEnergy(buffer, threshold: audibleThreshold)
     }
 
     func finish() async throws {
-        guard !isFinished else { return }
-        isFinished = true
-
-        let tailBuffers = try converter.finish()
-        for buffer in tailBuffers where buffer.frameLength > 0 {
-            try yieldToAnalyzer(buffer)
-        }
-        inputQueue.finish()
-
-        do {
-            try await analyzer.finalizeAndFinishThroughEndOfInput()
-        } catch {
-            await analyzer.cancelAndFinishNow()
-            resultsTask.cancel()
-            await awaitCancelledResultsTask()
-            throw error
-        }
-
-        resultsTask.cancel()
-        do {
-            try await resultsTask.value
-        } catch is CancellationError {
-            return
-        } catch {
-            throw error
-        }
-    }
-
-    private func yieldToAnalyzer(_ buffer: AVAudioPCMBuffer) throws {
-        do {
-            try inputQueue.yield(AnalyzerInput(buffer: buffer))
-        } catch BoundedAsyncQueueError.dropped {
-            throw SpeechPipelineError.analyzerInputDropped
-        } catch BoundedAsyncQueueError.terminated {
-            throw SpeechPipelineError.finished
-        }
-    }
-
-    private func awaitCancelledResultsTask() async {
-        do {
-            try await resultsTask.value
-        } catch is CancellationError {
-            return
-        } catch {
-            return
-        }
+        try await lifecycle.finish()
     }
 }

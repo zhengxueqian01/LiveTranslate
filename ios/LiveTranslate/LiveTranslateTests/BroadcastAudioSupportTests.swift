@@ -93,4 +93,172 @@ final class BroadcastAudioSupportTests: XCTestCase {
         XCTAssertTrue(state.takeWarningIfDue(at: .seconds(13), after: .seconds(3)))
         XCTAssertFalse(state.takeWarningIfDue(at: .seconds(14), after: .seconds(3)))
     }
+
+    func testAppendIsRejectedOnceFinishStarts() async throws {
+        let operations = ControlledSpeechPipelineOperations(
+            waitsForFinalizeRelease: true
+        )
+        let lifecycle = SpeechPipelineLifecycle(operations: operations)
+
+        let appendedValue = try await lifecycle.append(1)
+        XCTAssertEqual(appendedValue, 1)
+        let finishTask = Task {
+            try await lifecycle.finish()
+        }
+        await operations.waitUntilFinalizeStarts()
+
+        do {
+            _ = try await lifecycle.append(2)
+            XCTFail("Append must not succeed after finish starts")
+        } catch {
+            XCTAssertEqual(error as? SpeechPipelineLifecycleError, .finished)
+        }
+
+        operations.releaseFinalize()
+        try await finishTask.value
+        XCTAssertEqual(
+            operations.events,
+            [.append(1), .drainTail, .finishInput, .finalize, .cancelResults, .awaitResults]
+        )
+    }
+
+    func testFinishFailureStillCleansResourcesAndRepeatedFinishIsIdempotent() async {
+        let operations = ControlledSpeechPipelineOperations(drainError: .drainFailed)
+        let lifecycle = SpeechPipelineLifecycle(operations: operations)
+
+        let firstError = await capturedError {
+            try await lifecycle.finish()
+        }
+        let secondError = await capturedError {
+            try await lifecycle.finish()
+        }
+
+        XCTAssertEqual(firstError as? ControlledSpeechPipelineOperations.TestError, .drainFailed)
+        XCTAssertEqual(secondError as? ControlledSpeechPipelineOperations.TestError, .drainFailed)
+        XCTAssertEqual(
+            operations.events,
+            [.drainTail, .finishInput, .cancelAnalyzer, .cancelResults, .awaitResults]
+        )
+
+        do {
+            _ = try await lifecycle.append(1)
+            XCTFail("Append must not succeed after failed termination")
+        } catch {
+            XCTAssertEqual(error as? SpeechPipelineLifecycleError, .finished)
+        }
+    }
+
+    private func capturedError(
+        _ operation: () async throws -> Void
+    ) async -> (any Error)? {
+        do {
+            try await operation()
+            return nil
+        } catch {
+            return error
+        }
+    }
+}
+
+private final class ControlledSpeechPipelineOperations:
+    SpeechPipelineLifecycleOperations,
+    @unchecked Sendable
+{
+    enum TestError: Error, Equatable {
+        case drainFailed
+    }
+
+    enum Event: Equatable {
+        case append(Int)
+        case drainTail
+        case finishInput
+        case finalize
+        case cancelAnalyzer
+        case cancelResults
+        case awaitResults
+    }
+
+    typealias Sample = Int
+    typealias AppendResult = Int
+
+    private let lock = NSLock()
+    private let drainError: TestError?
+    private let waitsForFinalizeRelease: Bool
+    private let finalizeStarted: AsyncStream<Void>
+    private let finalizeStartedContinuation: AsyncStream<Void>.Continuation
+    private let finalizeRelease: AsyncStream<Void>
+    private let finalizeReleaseContinuation: AsyncStream<Void>.Continuation
+    private var recordedEvents: [Event] = []
+
+    var events: [Event] {
+        lock.withLock { recordedEvents }
+    }
+
+    init(
+        drainError: TestError? = nil,
+        waitsForFinalizeRelease: Bool = false
+    ) {
+        self.drainError = drainError
+        self.waitsForFinalizeRelease = waitsForFinalizeRelease
+        let startedPair = AsyncStream.makeStream(of: Void.self)
+        finalizeStarted = startedPair.stream
+        finalizeStartedContinuation = startedPair.continuation
+        let releasePair = AsyncStream.makeStream(of: Void.self)
+        finalizeRelease = releasePair.stream
+        finalizeReleaseContinuation = releasePair.continuation
+    }
+
+    func append(_ sample: Int) throws -> Int {
+        record(.append(sample))
+        return sample
+    }
+
+    func drainTail() throws {
+        record(.drainTail)
+        if let drainError {
+            throw drainError
+        }
+    }
+
+    func finishInput() {
+        record(.finishInput)
+    }
+
+    func finalizeAnalyzer() async throws {
+        record(.finalize)
+        finalizeStartedContinuation.yield()
+        guard waitsForFinalizeRelease else { return }
+        for await _ in finalizeRelease {
+            return
+        }
+    }
+
+    func cancelAnalyzer() async {
+        record(.cancelAnalyzer)
+    }
+
+    func cancelResults() {
+        record(.cancelResults)
+    }
+
+    func awaitResults() async throws {
+        record(.awaitResults)
+    }
+
+    func waitUntilFinalizeStarts() async {
+        for await _ in finalizeStarted {
+            return
+        }
+    }
+
+    func releaseFinalize() {
+        finalizeReleaseContinuation.yield()
+        finalizeReleaseContinuation.finish()
+    }
+
+    private func record(_ event: Event) {
+        lock.withLock {
+            recordedEvents.append(event)
+        }
+    }
 }

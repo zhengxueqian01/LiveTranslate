@@ -38,6 +38,94 @@ final class BoundedAsyncQueue<Element: Sendable>: Sendable {
     }
 }
 
+enum SpeechPipelineLifecycleError: Error, Equatable {
+    case finished
+}
+
+protocol SpeechPipelineLifecycleOperations: Sendable {
+    associatedtype Sample: Sendable
+    associatedtype AppendResult: Sendable
+
+    func append(_ sample: Sample) throws -> AppendResult
+    func drainTail() throws
+    func finishInput()
+    func finalizeAnalyzer() async throws
+    func cancelAnalyzer() async
+    func cancelResults()
+    func awaitResults() async throws
+}
+
+actor SpeechPipelineLifecycle<Operations: SpeechPipelineLifecycleOperations> {
+    private let operations: Operations
+    private var terminationTask: Task<Void, any Error>?
+
+    init(operations: Operations) {
+        self.operations = operations
+    }
+
+    func append(_ sample: Operations.Sample) throws -> Operations.AppendResult {
+        guard terminationTask == nil else {
+            throw SpeechPipelineLifecycleError.finished
+        }
+        return try operations.append(sample)
+    }
+
+    func finish() async throws {
+        let task: Task<Void, any Error>
+        if let terminationTask {
+            task = terminationTask
+        } else {
+            let operations = self.operations
+            let createdTask = Task<Void, any Error> {
+                try await Self.terminate(operations)
+            }
+            terminationTask = createdTask
+            task = createdTask
+        }
+        try await task.value
+    }
+
+    private static func terminate(_ operations: Operations) async throws {
+        var primaryError: (any Error)?
+
+        do {
+            try operations.drainTail()
+        } catch {
+            primaryError = error
+        }
+
+        operations.finishInput()
+
+        if primaryError == nil {
+            do {
+                try await operations.finalizeAnalyzer()
+            } catch {
+                primaryError = error
+            }
+        }
+
+        if primaryError != nil {
+            await operations.cancelAnalyzer()
+        }
+
+        operations.cancelResults()
+        do {
+            try await operations.awaitResults()
+        } catch is CancellationError {
+            // Expected after explicit result-task cancellation.
+        } catch {
+            if primaryError == nil {
+                primaryError = error
+                await operations.cancelAnalyzer()
+            }
+        }
+
+        if let primaryError {
+            throw primaryError
+        }
+    }
+}
+
 final class BroadcastCaptionCoordinator: @unchecked Sendable {
     private enum Lifecycle {
         case initialized
