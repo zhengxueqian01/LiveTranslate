@@ -3,23 +3,28 @@ import CoreMedia
 import Foundation
 
 private final class AudioConverterInputProvider: @unchecked Sendable {
-    private let buffer: AVAudioPCMBuffer
+    private let buffer: AVAudioPCMBuffer?
+    private let exhaustedStatus: AVAudioConverterInputStatus
     private let lock = NSLock()
     private var didSupplyBuffer = false
 
-    init(buffer: AVAudioPCMBuffer) {
+    init(
+        buffer: AVAudioPCMBuffer?,
+        exhaustedStatus: AVAudioConverterInputStatus
+    ) {
         self.buffer = buffer
+        self.exhaustedStatus = exhaustedStatus
     }
 
     func next(status: UnsafeMutablePointer<AVAudioConverterInputStatus>) -> AVAudioBuffer? {
         lock.withLock {
-            if didSupplyBuffer {
-                status.pointee = .endOfStream
-                return nil
+            if let buffer, !didSupplyBuffer {
+                didSupplyBuffer = true
+                status.pointee = .haveData
+                return buffer
             }
-            didSupplyBuffer = true
-            status.pointee = .haveData
-            return buffer
+            status.pointee = exhaustedStatus
+            return nil
         }
     }
 }
@@ -35,6 +40,8 @@ enum AudioPCMConverterError: LocalizedError {
     case converterUnavailable
     case outputBufferAllocationFailed
     case conversionFailed(String?)
+    case inputFormatChanged
+    case finished
 
     var errorDescription: String? {
         switch self {
@@ -62,14 +69,104 @@ enum AudioPCMConverterError: LocalizedError {
             } else {
                 "音频格式转换失败。"
             }
+        case .inputFormatChanged:
+            "ReplayKit 音频格式在广播期间发生变化。"
+        case .finished:
+            "音频格式转换器已经结束。"
         }
     }
 }
 
-struct AudioPCMConverter {
+final class AudioPCMConverter {
     let outputFormat: AVAudioFormat
 
+    private var converter: AVAudioConverter?
+    private var inputFormat: AVAudioFormat?
+    private var isFinished = false
+
+    init(outputFormat: AVAudioFormat) {
+        self.outputFormat = outputFormat
+    }
+
     func convert(_ sampleBuffer: CMSampleBuffer) throws -> AVAudioPCMBuffer {
+        guard !isFinished else {
+            throw AudioPCMConverterError.finished
+        }
+        return try withInputBuffer(from: sampleBuffer) { inputBuffer, inputFormat in
+            let converter = try streamingConverter(for: inputFormat)
+            let outputBuffer = try makeOutputBuffer(
+                inputFrameCount: inputBuffer.frameLength,
+                inputSampleRate: inputFormat.sampleRate
+            )
+            let inputProvider = AudioConverterInputProvider(
+                buffer: inputBuffer,
+                exhaustedStatus: .noDataNow
+            )
+            var conversionError: NSError?
+            let status = converter.convert(
+                to: outputBuffer,
+                error: &conversionError
+            ) { _, inputStatus in
+                inputProvider.next(status: inputStatus)
+            }
+            guard status != .error,
+                  status != .endOfStream,
+                  conversionError == nil else {
+                throw AudioPCMConverterError.conversionFailed(
+                    conversionError?.localizedDescription
+                )
+            }
+            return outputBuffer
+        }
+    }
+
+    func finish() throws -> [AVAudioPCMBuffer] {
+        guard !isFinished else { return [] }
+        isFinished = true
+        guard let converter else { return [] }
+
+        var outputs: [AVAudioPCMBuffer] = []
+        for _ in 0..<32 {
+            guard let outputBuffer = AVAudioPCMBuffer(
+                pcmFormat: outputFormat,
+                frameCapacity: AVAudioFrameCount(max(1_024, Int(outputFormat.sampleRate / 10)))
+            ) else {
+                throw AudioPCMConverterError.outputBufferAllocationFailed
+            }
+            let inputProvider = AudioConverterInputProvider(
+                buffer: nil,
+                exhaustedStatus: .endOfStream
+            )
+            var conversionError: NSError?
+            let status = converter.convert(
+                to: outputBuffer,
+                error: &conversionError
+            ) { _, inputStatus in
+                inputProvider.next(status: inputStatus)
+            }
+            guard status != .error, conversionError == nil else {
+                throw AudioPCMConverterError.conversionFailed(
+                    conversionError?.localizedDescription
+                )
+            }
+            if outputBuffer.frameLength > 0 {
+                outputs.append(outputBuffer)
+            }
+            if status == .endOfStream {
+                self.converter = nil
+                inputFormat = nil
+                return outputs
+            }
+        }
+        throw AudioPCMConverterError.conversionFailed(
+            "结束输入后转换器未在有限次数内完成。"
+        )
+    }
+
+    private func withInputBuffer<Result>(
+        from sampleBuffer: CMSampleBuffer,
+        body: (AVAudioPCMBuffer, AVAudioFormat) throws -> Result
+    ) throws -> Result {
         guard let formatDescription = CMSampleBufferGetFormatDescription(sampleBuffer) else {
             throw AudioPCMConverterError.missingFormatDescription
         }
@@ -121,7 +218,6 @@ struct AudioPCMConverter {
         guard extractionStatus == noErr else {
             throw AudioPCMConverterError.audioBufferExtractionFailed(extractionStatus)
         }
-        defer { withExtendedLifetime(retainedBlockBuffer) {} }
 
         let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
         guard !buffers.isEmpty,
@@ -145,8 +241,33 @@ struct AudioPCMConverter {
         }
         inputBuffer.frameLength = AVAudioFrameCount(sampleCount)
 
+        return try withExtendedLifetime(retainedBlockBuffer) {
+            try body(inputBuffer, inputFormat)
+        }
+    }
+
+    private func streamingConverter(for newInputFormat: AVAudioFormat) throws -> AVAudioConverter {
+        if let converter, let inputFormat {
+            guard inputFormat.isEqual(newInputFormat) else {
+                throw AudioPCMConverterError.inputFormatChanged
+            }
+            return converter
+        }
+        guard let converter = AVAudioConverter(from: newInputFormat, to: outputFormat) else {
+            throw AudioPCMConverterError.converterUnavailable
+        }
+        converter.primeMethod = .none
+        self.converter = converter
+        inputFormat = newInputFormat
+        return converter
+    }
+
+    private func makeOutputBuffer(
+        inputFrameCount: AVAudioFrameCount,
+        inputSampleRate: Double
+    ) throws -> AVAudioPCMBuffer {
         let scaledFrameCount = ceil(
-            Double(sampleCount) * outputFormat.sampleRate / inputFormat.sampleRate
+            Double(inputFrameCount) * outputFormat.sampleRate / inputSampleRate
         )
         guard scaledFrameCount.isFinite,
               scaledFrameCount > 0,
@@ -158,20 +279,6 @@ struct AudioPCMConverter {
             frameCapacity: AVAudioFrameCount(scaledFrameCount)
         ) else {
             throw AudioPCMConverterError.outputBufferAllocationFailed
-        }
-        guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
-            throw AudioPCMConverterError.converterUnavailable
-        }
-
-        let inputProvider = AudioConverterInputProvider(buffer: inputBuffer)
-        var conversionError: NSError?
-        let status = converter.convert(to: outputBuffer, error: &conversionError) { _, inputStatus in
-            inputProvider.next(status: inputStatus)
-        }
-        guard status != .error,
-              conversionError == nil,
-              outputBuffer.frameLength > 0 else {
-            throw AudioPCMConverterError.conversionFailed(conversionError?.localizedDescription)
         }
         return outputBuffer
     }

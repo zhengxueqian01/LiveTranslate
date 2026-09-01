@@ -5,113 +5,82 @@
 //  Created by Xueqian Zheng on 2026/9/1.
 //
 
-import AVFAudio
 import CoreMedia
 import Foundation
 import ReplayKit
 
 enum BroadcastCaptureError: LocalizedError {
     case sourceLanguageMissing
+    case audioQueueDropped
+    case audioQueueTerminated
 
     var errorDescription: String? {
         switch self {
         case .sourceLanguageMissing:
             "未找到来源语言，请返回主 App 选择语言后重新开始直播。"
-        }
-    }
-}
-
-private final class CaptionStatusWriter: @unchecked Sendable {
-    private let store: CaptionStore
-    private let lock = NSLock()
-
-    init() throws {
-        store = try CaptionStore()
-    }
-
-    func write(
-        sourceText: String? = nil,
-        phase: SessionPhase,
-        errorMessage: String?
-    ) throws {
-        try lock.withLock {
-            let previous = try store.load()
-            let snapshot = CaptionSnapshot(
-                revision: (previous?.revision ?? 0) + 1,
-                sourceText: sourceText ?? previous?.sourceText ?? "",
-                translatedText: previous?.translatedText ?? "",
-                phase: phase,
-                errorMessage: errorMessage,
-                updatedAt: Date()
-            )
-            try store.save(snapshot)
+        case .audioQueueDropped:
+            "App 音频处理速度不足，启动或运行队列已满。"
+        case .audioQueueTerminated:
+            "App 音频队列已结束，无法继续接收音频。"
         }
     }
 }
 
 final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
+    private static let audioQueueCapacity = 32
     private static let audibleThreshold: Float = 0.001
-    private static let silenceWarningDuration: TimeInterval = 3
+    private static let silenceWarningDuration = Duration.seconds(3)
+    private static let silenceCheckInterval = Duration.milliseconds(250)
     private static let silenceWarning =
         "连续 3 秒未检测到有效 App 音频；来源可能静音、受 DRM 保护或不允许捕获。"
 
     private let stateLock = NSLock()
-    private var pipeline: SpeechPipeline?
-    private var statusWriter: CaptionStatusWriter?
-    private var startTask: Task<Void, Never>?
+    private let clock = ContinuousClock()
+    private var clockOrigin: ContinuousClock.Instant?
+    private var silenceState = SilenceMonitorState()
+    private var captionCoordinator: BroadcastCaptionCoordinator?
+    private var audioQueue: BoundedAsyncQueue<CapturedAudioSample>?
+    private var audioTask: Task<Void, Never>?
     private var silenceMonitorTask: Task<Void, Never>?
-    private var lastAudibleDate: Date?
-    private var didReportSilence = false
-    private var didFinish = false
+    private var isEnding = false
+    private var didComplete = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String : NSObject]?) {
         do {
-            let writer = try CaptionStatusWriter()
+            let coordinator = BroadcastCaptionCoordinator(store: try CaptionStore())
             stateLock.withLock {
-                statusWriter = writer
+                captionCoordinator = coordinator
+                clockOrigin = clock.now
+                silenceState.start(at: .zero)
             }
+
             let sourceStore = try SourceLanguageStore()
             guard let source = sourceStore.load() else {
                 throw BroadcastCaptureError.sourceLanguageMissing
             }
-            try writer.write(phase: .broadcasting, errorMessage: nil)
+            try coordinator.begin()
 
-            let task = Task { [weak self] in
-                do {
-                    let createdPipeline = try await SpeechPipeline.start(source: source) { [weak self] text in
-                        self?.handleRecognizedText(text)
-                    }
-                    guard let self else {
-                        await createdPipeline.finish()
-                        return
-                    }
-                    let accepted = stateLock.withLock {
-                        guard !didFinish else { return false }
-                        pipeline = createdPipeline
-                        return true
-                    }
-                    if accepted {
-                        startSilenceMonitor()
-                        do {
-                            try writer.write(phase: .recognizing, errorMessage: nil)
-                        } catch {
-                            failBroadcast(error)
-                        }
-                    } else {
-                        await createdPipeline.finish()
-                    }
-                } catch is CancellationError {
-                    return
-                } catch {
-                    self?.failBroadcast(error)
-                }
+            let queue = BoundedAsyncQueue<CapturedAudioSample>(
+                capacity: Self.audioQueueCapacity
+            )
+            let sessionTask = Task { [weak self] in
+                _ = await self?.runAudioSession(
+                    source: source,
+                    queue: queue,
+                    coordinator: coordinator
+                )
             }
+            let monitorTask = makeSilenceMonitor(coordinator: coordinator)
             stateLock.withLock {
-                if didFinish {
-                    task.cancel()
-                } else {
-                    startTask = task
+                guard !didComplete else {
+                    queue.finish()
+                    sessionTask.cancel()
+                    monitorTask.cancel()
+                    return
                 }
+                audioQueue = queue
+                audioTask = sessionTask
+                silenceMonitorTask = monitorTask
             }
         } catch {
             failBroadcast(error)
@@ -119,161 +88,216 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     }
 
     override func broadcastPaused() {
-        // User has requested to pause the broadcast. Samples will stop being delivered.
+        stateLock.withLock {
+            guard !didComplete, !isEnding else { return }
+            silenceState.pause()
+        }
     }
 
     override func broadcastResumed() {
-        // User has requested to resume the broadcast. Samples delivery will resume.
+        let resources = stateLock.withLock { () -> (Bool, BroadcastCaptionCoordinator?) in
+            guard !didComplete, !isEnding else { return (false, nil) }
+            let shouldClear = silenceState.resume(at: elapsedLocked())
+            return (shouldClear, captionCoordinator)
+        }
+        guard resources.0, let coordinator = resources.1 else { return }
+        do {
+            try coordinator.clearSilenceWarning()
+        } catch {
+            failBroadcast(error)
+        }
     }
 
     override func broadcastFinished() {
-        let resources = stateLock.withLock { () -> (Bool, Task<Void, Never>?, Task<Void, Never>?, SpeechPipeline?, CaptionStatusWriter?) in
-            let shouldWriteStopped = !didFinish
-            didFinish = true
-            let resources = (shouldWriteStopped, startTask, silenceMonitorTask, pipeline, statusWriter)
-            startTask = nil
+        let resources = stateLock.withLock { () -> (BoundedAsyncQueue<CapturedAudioSample>?, Task<Void, Never>?) in
+            guard !didComplete, !isEnding else { return (nil, nil) }
+            isEnding = true
+            let monitorTask = silenceMonitorTask
             silenceMonitorTask = nil
-            pipeline = nil
-            return resources
+            return (audioQueue, monitorTask)
         }
         resources.1?.cancel()
-        resources.2?.cancel()
-        if resources.0, let writer = resources.4 {
-            try? writer.write(phase: .stopped, errorMessage: nil)
-        }
-        if let pipeline = resources.3 {
-            Task {
-                await pipeline.finish()
-            }
-        }
+        resources.0?.finish()
     }
 
-    override func processSampleBuffer(_ sampleBuffer: CMSampleBuffer, with sampleBufferType: RPSampleBufferType) {
-        switch sampleBufferType {
-        case .audioApp:
-            processAppAudio(sampleBuffer)
-        case .audioMic, .video:
-            return
-        @unknown default:
+    override func processSampleBuffer(
+        _ sampleBuffer: CMSampleBuffer,
+        with sampleBufferType: RPSampleBufferType
+    ) {
+        guard sampleBufferType == .audioApp else { return }
+        guard let queue = stateLock.withLock({
+            didComplete || isEnding ? nil : audioQueue
+        }) else {
             return
         }
-    }
 
-    private func processAppAudio(_ sampleBuffer: CMSampleBuffer) {
-        guard let pipeline = stateLock.withLock({ didFinish ? nil : pipeline }) else {
-            return
-        }
         do {
-            let buffer = try pipeline.append(sampleBuffer)
-            updateSilenceState(
-                hasAudibleEnergy: AudioPCMConverter.hasAudibleEnergy(
-                    buffer,
-                    threshold: Self.audibleThreshold
-                )
-            )
+            try queue.yield(CapturedAudioSample(buffer: sampleBuffer))
+        } catch BoundedAsyncQueueError.dropped {
+            failBroadcast(BroadcastCaptureError.audioQueueDropped)
+        } catch BoundedAsyncQueueError.terminated {
+            let shouldFail = stateLock.withLock { !didComplete && !isEnding }
+            if shouldFail {
+                failBroadcast(BroadcastCaptureError.audioQueueTerminated)
+            }
         } catch {
             failBroadcast(error)
         }
     }
 
-    private func startSilenceMonitor() {
-        let task = Task { [weak self] in
+    private func runAudioSession(
+        source: SourceLanguage,
+        queue: BoundedAsyncQueue<CapturedAudioSample>,
+        coordinator: BroadcastCaptionCoordinator
+    ) async {
+        var pipeline: SpeechPipeline?
+        do {
+            let startedPipeline = try await SpeechPipeline.start(
+                source: source,
+                onText: { [weak self] text in
+                    do {
+                        try coordinator.updateText(text)
+                    } catch {
+                        self?.failBroadcast(error)
+                    }
+                },
+                onFailure: { [weak self] error in
+                    self?.failBroadcast(error)
+                }
+            )
+            pipeline = startedPipeline
+            try coordinator.markRecognizing()
+
+            for await sample in queue.stream {
+                try Task.checkCancellation()
+                let isAudible = try await startedPipeline.append(
+                    sample,
+                    audibleThreshold: Self.audibleThreshold
+                )
+                if isAudible {
+                    recordAudibleEnergy(coordinator: coordinator)
+                }
+            }
+
+            try Task.checkCancellation()
+            try await startedPipeline.finish()
+            pipeline = nil
+            try coordinator.stop()
+            completeNormally()
+        } catch is CancellationError {
+            if let pipeline {
+                await finishAfterTermination(pipeline)
+            }
+        } catch {
+            failBroadcast(error)
+            if let pipeline {
+                await finishAfterTermination(pipeline)
+            }
+        }
+    }
+
+    private func makeSilenceMonitor(
+        coordinator: BroadcastCaptionCoordinator
+    ) -> Task<Void, Never> {
+        Task { [weak self] in
+            guard let self else { return }
             while !Task.isCancelled {
                 do {
-                    try await Task.sleep(for: .milliseconds(250))
+                    try await clock.sleep(for: Self.silenceCheckInterval)
                 } catch {
                     return
                 }
-                self?.reportSilenceIfNeeded()
+                let shouldReport = stateLock.withLock {
+                    guard !didComplete, !isEnding else { return false }
+                    return silenceState.takeWarningIfDue(
+                        at: elapsedLocked(),
+                        after: Self.silenceWarningDuration
+                    )
+                }
+                guard shouldReport else { continue }
+                do {
+                    try coordinator.reportSilence(message: Self.silenceWarning)
+                } catch {
+                    failBroadcast(error)
+                    return
+                }
             }
-        }
-        stateLock.withLock {
-            guard !didFinish else {
-                task.cancel()
-                return
-            }
-            lastAudibleDate = Date()
-            silenceMonitorTask = task
         }
     }
 
-    private func updateSilenceState(hasAudibleEnergy: Bool) {
-        guard hasAudibleEnergy else { return }
-        let writerToClear = stateLock.withLock { () -> CaptionStatusWriter? in
-            guard !didFinish else { return nil }
-            lastAudibleDate = Date()
-            guard didReportSilence else { return nil }
-            didReportSilence = false
-            return statusWriter
+    private func recordAudibleEnergy(
+        coordinator: BroadcastCaptionCoordinator
+    ) {
+        let shouldClear = stateLock.withLock {
+            guard !didComplete, !isEnding else { return false }
+            return silenceState.markAudible(at: elapsedLocked())
         }
-        guard let writerToClear else { return }
+        guard shouldClear else { return }
         do {
-            try writerToClear.write(phase: .recognizing, errorMessage: nil)
+            try coordinator.clearSilenceWarning()
         } catch {
             failBroadcast(error)
         }
     }
 
-    private func reportSilenceIfNeeded() {
-        let writerToNotify = stateLock.withLock { () -> CaptionStatusWriter? in
-            guard !didFinish,
-                  !didReportSilence,
-                  let lastAudibleDate,
-                  Date().timeIntervalSince(lastAudibleDate) >= Self.silenceWarningDuration else {
-                return nil
-            }
-            didReportSilence = true
-            return statusWriter
-        }
-        guard let writerToNotify else { return }
-        do {
-            try writerToNotify.write(
-                phase: .recognizing,
-                errorMessage: Self.silenceWarning
-            )
-        } catch {
-            failBroadcast(error)
-        }
+    private func elapsedLocked() -> Duration {
+        guard let clockOrigin else { return .zero }
+        return clockOrigin.duration(to: clock.now)
     }
 
-    private func handleRecognizedText(_ text: String) {
-        guard let writer = stateLock.withLock({ didFinish ? nil : statusWriter }) else {
-            return
+    private func completeNormally() {
+        let monitorTask = stateLock.withLock { () -> Task<Void, Never>? in
+            guard !didComplete else { return nil }
+            didComplete = true
+            isEnding = true
+            let monitorTask = silenceMonitorTask
+            silenceMonitorTask = nil
+            audioQueue = nil
+            audioTask = nil
+            return monitorTask
         }
-        do {
-            try writer.write(
-                sourceText: text,
-                phase: .recognizing,
-                errorMessage: nil
-            )
-        } catch {
-            failBroadcast(error)
-        }
+        monitorTask?.cancel()
     }
 
     private func failBroadcast(_ error: any Error) {
-        let resources = stateLock.withLock { () -> (Task<Void, Never>?, Task<Void, Never>?, SpeechPipeline?, CaptionStatusWriter?)? in
-            guard !didFinish else { return nil }
-            didFinish = true
-            let resources = (startTask, silenceMonitorTask, pipeline, statusWriter)
-            startTask = nil
+        let resources = stateLock.withLock { () -> (
+            BoundedAsyncQueue<CapturedAudioSample>?,
+            Task<Void, Never>?,
+            Task<Void, Never>?,
+            BroadcastCaptionCoordinator?
+        )? in
+            guard !didComplete else { return nil }
+            didComplete = true
+            isEnding = true
+            let resources = (
+                audioQueue,
+                audioTask,
+                silenceMonitorTask,
+                captionCoordinator
+            )
+            audioQueue = nil
+            audioTask = nil
             silenceMonitorTask = nil
-            pipeline = nil
             return resources
         }
         guard let resources else { return }
 
-        resources.0?.cancel()
+        resources.0?.finish()
         resources.1?.cancel()
-        try? resources.3?.write(
-            phase: .failed,
-            errorMessage: error.localizedDescription
-        )
-        if let pipeline = resources.2 {
-            Task {
-                await pipeline.finish()
-            }
+        resources.2?.cancel()
+        do {
+            try resources.3?.fail(message: error.localizedDescription)
+        } catch {
+            // The original failure remains the error reported to ReplayKit.
         }
         finishBroadcastWithError(error as NSError)
+    }
+
+    private func finishAfterTermination(_ pipeline: SpeechPipeline) async {
+        do {
+            try await pipeline.finish()
+        } catch {
+            // A primary terminal error has already been reported by this point.
+        }
     }
 }
