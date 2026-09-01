@@ -46,6 +46,10 @@ struct ContentView: View {
                 }
 
                 Section("字幕预览") {
+                    CaptionPiPHostViewRepresentable(hostView: captionPiPController.hostView)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 112)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
                     Text(viewModel.latestSnapshot?.sourceText ?? "等待原文字幕")
                     Text(viewModel.latestSnapshot?.translatedText ?? "等待中文翻译")
                         .foregroundStyle(.secondary)

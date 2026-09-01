@@ -65,7 +65,10 @@ struct CaptionPiPStartCoordinator {
 final class CaptionPiPController: NSObject, ObservableObject {
     private let renderer: CaptionFrameRenderer
     private let renderSize: CGSize
-    private let displayLayer = AVSampleBufferDisplayLayer()
+    let hostView: CaptionPiPHostView
+    var displayLayer: AVSampleBufferDisplayLayer {
+        hostView.captionDisplayLayer
+    }
     private var pictureInPictureController: AVPictureInPictureController?
     private var lastRenderedRevision: UInt64?
     private var startCoordinator = CaptionPiPStartCoordinator()
@@ -79,6 +82,7 @@ final class CaptionPiPController: NSObject, ObservableObject {
     ) {
         self.renderer = renderer
         self.renderSize = renderSize
+        hostView = CaptionPiPHostView()
         super.init()
 
         guard AVPictureInPictureController.isPictureInPictureSupported() else {
