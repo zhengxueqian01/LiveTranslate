@@ -14,6 +14,7 @@ struct CaptionSegmenter: Sendable {
     private let minimumIntervalMilliseconds: UInt64
     private var displayedText = ""
     private var lastCandidateText = ""
+    private var lastCandidateWasFinal = false
     private var firstPendingTimestamp: UInt64?
     private var lastCandidateTimestamp: UInt64?
     private var nextRevision: UInt64 = 1
@@ -43,10 +44,14 @@ struct CaptionSegmenter: Sendable {
         }
 
         if isFinal {
-            guard normalizedText != lastCandidateText else {
+            guard normalizedText != lastCandidateText || !lastCandidateWasFinal else {
                 return nil
             }
-            return makeCandidateUpdate(text: normalizedText, timestampMilliseconds: timestampMilliseconds)
+            return makeCandidateUpdate(
+                text: normalizedText,
+                isFinal: true,
+                timestampMilliseconds: timestampMilliseconds
+            )
         }
 
         guard normalizedText.count >= 4 else {
@@ -59,16 +64,22 @@ struct CaptionSegmenter: Sendable {
             return SegmentUpdate(displayText: normalizedText, translationCandidate: nil)
         }
 
-        return makeCandidateUpdate(text: normalizedText, timestampMilliseconds: timestampMilliseconds)
+        return makeCandidateUpdate(
+            text: normalizedText,
+            isFinal: false,
+            timestampMilliseconds: timestampMilliseconds
+        )
     }
 
     private mutating func makeCandidateUpdate(
         text: String,
+        isFinal: Bool,
         timestampMilliseconds: UInt64
     ) -> SegmentUpdate {
         let candidate = TranslationCandidate(revision: nextRevision, text: text)
         nextRevision += 1
         lastCandidateText = text
+        lastCandidateWasFinal = isFinal
         lastCandidateTimestamp = timestampMilliseconds
         firstPendingTimestamp = nil
         return SegmentUpdate(displayText: text, translationCandidate: candidate)

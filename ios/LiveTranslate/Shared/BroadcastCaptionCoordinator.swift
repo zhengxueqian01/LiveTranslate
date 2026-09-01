@@ -11,6 +11,11 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
         case terminal
     }
 
+    private struct PendingTranslation {
+        let generation: UInt64
+        let task: Task<Void, Never>
+    }
+
     private let translator: (any CaptionTranslating)?
     private let store: any CaptionStoreProtocol
     private let onFailure: @Sendable (any Error) async -> Void
@@ -19,7 +24,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
     private var hasSilenceWarning = false
     private var segmenter = CaptionSegmenter(minimumIntervalMilliseconds: 800)
     private var generation: UInt64 = 0
-    private var translationTasks: [UInt64: Task<Void, Never>] = [:]
+    private var pendingTranslation: PendingTranslation?
     private var terminalError: (any Error)?
 
     init(store: any CaptionStoreProtocol) {
@@ -91,10 +96,12 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                 }
 
                 let previous = try store.load()
-                if previous?.sourceText != update.displayText {
-                    generation &+= 1
+                let sourceChanged = previous?.sourceText != update.displayText
+                if sourceChanged {
+                    advanceGenerationLocked()
                     try write(
                         sourceText: update.displayText,
+                        translatedText: "",
                         phase: .recognizing,
                         errorMessage: hasSilenceWarning ? previous?.errorMessage : nil
                     )
@@ -105,24 +112,44 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                     return nil
                 }
 
-                if previous?.sourceText == update.displayText {
-                    generation &+= 1
+                if !sourceChanged {
+                    advanceGenerationLocked()
                 }
                 let candidateGeneration = generation
-                let task = Task { [weak self, translator] in
-                    guard let self else { return }
-                    await self.runTranslation(
-                        candidate.text,
-                        generation: candidateGeneration,
-                        translator: translator
-                    )
+                let task = Task { [weak self, translator, sourceText = candidate.text] in
+                    do {
+                        let translatedText = try await translator.translate(sourceText)
+                        guard let self else { return }
+                        let failure = self.completeTranslation(
+                            translatedText,
+                            generation: candidateGeneration
+                        )
+                        self.removePendingTranslation(generation: candidateGeneration)
+                        if let failure {
+                            await self.onFailure(failure)
+                        }
+                    } catch {
+                        guard let self else { return }
+                        let failure = self.completeTranslationFailure(
+                            error,
+                            generation: candidateGeneration
+                        )
+                        self.removePendingTranslation(generation: candidateGeneration)
+                        if let failure {
+                            await self.onFailure(failure)
+                        }
+                    }
                 }
-                translationTasks[candidateGeneration] = task
+                pendingTranslation = PendingTranslation(
+                    generation: candidateGeneration,
+                    task: task
+                )
                 return nil
             } catch {
                 lifecycle = .terminal
                 terminalError = error
                 hasSilenceWarning = false
+                cancelPendingTranslationLocked()
                 return error
             }
         }
@@ -133,21 +160,8 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
     }
 
     func flushPendingTranslations() async throws {
-        while true {
-            let currentTask = lock.withLock {
-                translationTasks[generation]
-            }
-            guard let currentTask else { break }
-            await currentTask.value
-        }
-
-        let staleTasks = lock.withLock {
-            Array(translationTasks.values)
-        }
-        staleTasks.forEach { $0.cancel() }
-        for task in staleTasks {
-            await task.value
-        }
+        let currentTask = lock.withLock { pendingTranslation?.task }
+        await currentTask?.value
 
         if let terminalError = lock.withLock({ terminalError }) {
             throw terminalError
@@ -173,45 +187,56 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
     func fail(message: String) throws {
         try lock.withLock {
             guard lifecycle != .terminal else { return }
-            try write(phase: .failed, errorMessage: message)
-            lifecycle = .terminal
-            hasSilenceWarning = false
+            do {
+                try write(phase: .failed, errorMessage: message)
+                lifecycle = .terminal
+                hasSilenceWarning = false
+                cancelPendingTranslationLocked()
+            } catch {
+                lifecycle = .terminal
+                terminalError = error
+                hasSilenceWarning = false
+                cancelPendingTranslationLocked()
+                throw error
+            }
         }
     }
 
     func stop() throws {
         try lock.withLock {
             guard lifecycle != .terminal else { return }
-            try write(phase: .stopped, errorMessage: nil)
-            lifecycle = .terminal
-            hasSilenceWarning = false
+            do {
+                try write(phase: .stopped, errorMessage: nil)
+                lifecycle = .terminal
+                hasSilenceWarning = false
+                cancelPendingTranslationLocked()
+            } catch {
+                lifecycle = .terminal
+                terminalError = error
+                hasSilenceWarning = false
+                cancelPendingTranslationLocked()
+                throw error
+            }
         }
     }
 
-    private func runTranslation(
-        _ sourceText: String,
-        generation candidateGeneration: UInt64,
-        translator: any CaptionTranslating
-    ) async {
-        let failure: (any Error)?
-        do {
-            let translatedText = try await translator.translate(sourceText)
-            failure = completeTranslation(
-                translatedText,
-                generation: candidateGeneration
-            )
-        } catch {
-            failure = completeTranslationFailure(
-                error,
-                generation: candidateGeneration
-            )
-        }
+    private func advanceGenerationLocked() {
+        generation &+= 1
+        cancelPendingTranslationLocked()
+    }
 
-        if let failure {
-            await onFailure(failure)
-        }
-        _ = lock.withLock {
-            translationTasks.removeValue(forKey: candidateGeneration)
+    private func cancelPendingTranslationLocked() {
+        let task = pendingTranslation?.task
+        pendingTranslation = nil
+        task?.cancel()
+    }
+
+    private func removePendingTranslation(generation candidateGeneration: UInt64) {
+        lock.withLock {
+            guard pendingTranslation?.generation == candidateGeneration else {
+                return
+            }
+            pendingTranslation = nil
         }
     }
 
@@ -236,6 +261,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                 lifecycle = .terminal
                 terminalError = error
                 hasSilenceWarning = false
+                cancelPendingTranslationLocked()
                 return error
             }
         }
@@ -258,11 +284,13 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                 lifecycle = .terminal
                 terminalError = error
                 hasSilenceWarning = false
+                cancelPendingTranslationLocked()
                 return error
             } catch {
                 lifecycle = .terminal
                 terminalError = error
                 hasSilenceWarning = false
+                cancelPendingTranslationLocked()
                 return error
             }
         }

@@ -22,6 +22,7 @@ actor AppleTranslationClient: CaptionTranslating {
     private let source: Locale.Language
     private let target = SourceLanguage.translationTarget
     private let session: TranslationSession
+    private let serialExecutor = AsyncSerialExecutor()
     private var didVerifyResources = false
 
     init(source: SourceLanguage) {
@@ -41,6 +42,12 @@ actor AppleTranslationClient: CaptionTranslating {
     }
 
     func translate(_ text: String) async throws -> String {
+        try await serialExecutor.run { [self] in
+            try await translateSerially(text)
+        }
+    }
+
+    private func translateSerially(_ text: String) async throws -> String {
         if !didVerifyResources {
             try await verifyResources()
             didVerifyResources = true
