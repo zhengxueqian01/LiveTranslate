@@ -34,6 +34,7 @@ final class AppViewModel: ObservableObject {
     private var speechErrorMessage: String?
     private var translationErrorMessage: String?
     private var captionErrorMessage: String?
+    private var captionObservationTask: Task<Void, Never>?
 
     var canStartBroadcast: Bool {
         store != nil && speechStatus == .installed && isTranslationReady && errorMessage == nil
@@ -53,6 +54,7 @@ final class AppViewModel: ObservableObject {
         speechErrorMessage = nil
         translationErrorMessage = nil
         captionErrorMessage = nil
+        captionObservationTask = nil
         selectedLanguage = languageStore.load() ?? .english
         errorMessage = storageErrorMessage
     }
@@ -65,6 +67,7 @@ final class AppViewModel: ObservableObject {
         speechErrorMessage = nil
         translationErrorMessage = nil
         captionErrorMessage = nil
+        captionObservationTask = nil
         selectedLanguage = .english
         self.errorMessage = errorMessage
     }
@@ -153,6 +156,35 @@ final class AppViewModel: ObservableObject {
             captionErrorMessage = "字幕状态读取失败：\(error.localizedDescription)"
             refreshErrorMessage()
         }
+    }
+
+    func startCaptionObservation() {
+        captionObservationTask?.cancel()
+        captionObservationTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(250))
+                } catch is CancellationError {
+                    return
+                } catch {
+                    return
+                }
+
+                guard !Task.isCancelled else {
+                    return
+                }
+                self?.refreshCaption()
+            }
+        }
+    }
+
+    func stopCaptionObservation() {
+        captionObservationTask?.cancel()
+        captionObservationTask = nil
+    }
+
+    deinit {
+        captionObservationTask?.cancel()
     }
 
     private func refreshErrorMessage() {

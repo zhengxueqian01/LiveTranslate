@@ -12,6 +12,7 @@ struct ContentView: View {
     @StateObject private var viewModel: AppViewModel
     @State private var translationConfiguration: TranslationSession.Configuration?
     @State private var translationSourceLanguage: SourceLanguage = .english
+    @State private var captionPiPController = CaptionPiPController()
 
     init(viewModel: AppViewModel? = nil) {
         _viewModel = StateObject(wrappedValue: viewModel ?? AppViewModel.live())
@@ -48,6 +49,12 @@ struct ContentView: View {
                     Text(viewModel.latestSnapshot?.sourceText ?? "等待原文字幕")
                     Text(viewModel.latestSnapshot?.translatedText ?? "等待中文翻译")
                         .foregroundStyle(.secondary)
+                    if captionPiPController.isSupported {
+                        Button("打开画中画字幕") {
+                            viewModel.startCaptionObservation()
+                            captionPiPController.start()
+                        }
+                    }
                 }
 
                 Section("系统广播") {
@@ -76,8 +83,24 @@ struct ContentView: View {
             .navigationTitle("实时字幕翻译")
             .task {
                 viewModel.refreshCaption()
+                viewModel.startCaptionObservation()
                 await viewModel.refreshModelStatus()
                 configureTranslation()
+            }
+            .onAppear {
+                captionPiPController.didStop = {
+                    viewModel.stopCaptionObservation()
+                }
+            }
+            .onChange(of: viewModel.latestSnapshot) { _, snapshot in
+                guard let snapshot else {
+                    return
+                }
+                captionPiPController.render(snapshot)
+            }
+            .onDisappear {
+                viewModel.stopCaptionObservation()
+                captionPiPController.stop()
             }
             .onChange(of: viewModel.selectedLanguage) {
                 viewModel.markTranslationNeedsPreparation()

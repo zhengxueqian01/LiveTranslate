@@ -3,6 +3,54 @@ import XCTest
 
 @MainActor
 final class AppViewModelTests: XCTestCase {
+    func testCaptionObservationRefreshesSharedStoreAfterPollingInterval() async throws {
+        let store = InMemoryCaptionStore()
+        let viewModel = AppViewModel(
+            modelService: FakeModelPreparationService(status: .installed),
+            store: store,
+            languageStore: SourceLanguageStore(defaults: .standard)
+        )
+        let snapshot = CaptionSnapshot(
+            revision: 7,
+            sourceText: "Hello",
+            translatedText: "你好",
+            phase: .translating,
+            errorMessage: nil,
+            updatedAt: .now
+        )
+        try store.save(snapshot)
+
+        viewModel.startCaptionObservation()
+        defer { viewModel.stopCaptionObservation() }
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(viewModel.latestSnapshot, snapshot)
+    }
+
+    func testStoppingCaptionObservationPreventsSubsequentStoreRefreshes() async throws {
+        let store = InMemoryCaptionStore()
+        let viewModel = AppViewModel(
+            modelService: FakeModelPreparationService(status: .installed),
+            store: store,
+            languageStore: SourceLanguageStore(defaults: .standard)
+        )
+        let snapshot = CaptionSnapshot(
+            revision: 9,
+            sourceText: "Goodbye",
+            translatedText: "再见",
+            phase: .translating,
+            errorMessage: nil,
+            updatedAt: .now
+        )
+
+        viewModel.startCaptionObservation()
+        viewModel.stopCaptionObservation()
+        try store.save(snapshot)
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertNil(viewModel.latestSnapshot)
+    }
+
     func testOldLanguageInstallationFailureDoesNotOverwriteCurrentSpeechStatus() async {
         let service = ControlledModelPreparationService()
         let viewModel = AppViewModel(
