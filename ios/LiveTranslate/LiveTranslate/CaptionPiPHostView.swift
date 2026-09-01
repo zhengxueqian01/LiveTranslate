@@ -4,6 +4,8 @@ import UIKit
 
 @MainActor
 final class CaptionPiPHostView: UIView {
+    var didMount: (() -> Void)?
+
     override class var layerClass: AnyClass {
         AVSampleBufferDisplayLayer.self
     }
@@ -22,6 +24,23 @@ final class CaptionPiPHostView: UIView {
         super.init(coder: coder)
         captionDisplayLayer.videoGravity = .resizeAspect
         backgroundColor = .black
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        notifyIfMounted()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        notifyIfMounted()
+    }
+
+    private func notifyIfMounted() {
+        guard window != nil, bounds.width > 0, bounds.height > 0 else {
+            return
+        }
+        didMount?()
     }
 }
 

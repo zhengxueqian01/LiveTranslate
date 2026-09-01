@@ -75,6 +75,9 @@ struct CaptionFrameRenderer {
         let sourceColor = snapshot.phase == .failed ? UIColor.systemYellow : UIColor.white
         let translationColor = snapshot.phase == .failed ? UIColor.systemRed : UIColor.white
 
+        context.saveGState()
+        context.translateBy(x: 0, y: size.height)
+        context.scaleBy(x: 1, y: -1)
         UIGraphicsPushContext(context)
         (snapshot.sourceText as NSString).draw(
             in: sourceRect,
@@ -91,6 +94,7 @@ struct CaptionFrameRenderer {
             ]
         )
         UIGraphicsPopContext()
+        context.restoreGState()
     }
 
     private func displayedTranslation(for snapshot: CaptionSnapshot) -> String {

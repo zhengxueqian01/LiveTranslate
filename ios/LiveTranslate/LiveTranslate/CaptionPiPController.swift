@@ -29,63 +29,70 @@ enum CaptionPiPStartState: Equatable {
     }
 }
 
-struct CaptionPiPStartCoordinator {
-    private(set) var state: CaptionPiPStartState = .idle
-    private var hasEnqueuedFrame = false
-
-    mutating func requestStart(isPossible: Bool) -> Bool {
-        state = .pending
-        return startIfReady(isPossible: isPossible)
-    }
-
-    mutating func didEnqueueFrame(isPossible: Bool) -> Bool {
-        hasEnqueuedFrame = true
-        return startIfReady(isPossible: isPossible)
-    }
-
-    mutating func didFailToStart(errorDescription: String) {
-        state = .failed("画中画字幕启动失败：\(errorDescription)")
-    }
-
-    mutating func stop() {
-        state = .idle
-        hasEnqueuedFrame = false
-    }
-
-    private mutating func startIfReady(isPossible: Bool) -> Bool {
-        guard state == .pending, hasEnqueuedFrame, isPossible else {
-            return false
-        }
-        state = .active
-        return true
-    }
-}
-
 @MainActor
 final class CaptionPiPController: NSObject, ObservableObject {
     private let renderer: CaptionFrameRenderer
     private let renderSize: CGSize
+    private let audioSession: any CaptionPiPAudioSessionPreparing
     let hostView: CaptionPiPHostView
     var displayLayer: AVSampleBufferDisplayLayer {
         hostView.captionDisplayLayer
     }
     private var pictureInPictureController: AVPictureInPictureController?
+    private var readinessObservation: NSKeyValueObservation?
     private var lastRenderedRevision: UInt64?
-    private var startCoordinator = CaptionPiPStartCoordinator()
+    private var startupCoordinator: CaptionPiPStartupCoordinator!
 
     @Published private(set) var startState: CaptionPiPStartState = .idle
+    @Published private(set) var isReadyForPictureInPicture = false
     var didStop: (() -> Void)?
 
     init(
         renderer: CaptionFrameRenderer = CaptionFrameRenderer(),
-        renderSize: CGSize = CGSize(width: 960, height: 320)
+        renderSize: CGSize = CGSize(width: 960, height: 320),
+        audioSession: any CaptionPiPAudioSessionPreparing = SystemCaptionPiPAudioSessionPreparer()
     ) {
         self.renderer = renderer
         self.renderSize = renderSize
+        self.audioSession = audioSession
         hostView = CaptionPiPHostView()
         super.init()
+        startupCoordinator = CaptionPiPStartupCoordinator(
+            audioSession: audioSession,
+            startPictureInPicture: { [weak self] in
+                self?.pictureInPictureController?.startPictureInPicture()
+            },
+            stateDidChange: { [weak self] state in
+                self?.startState = state
+            }
+        )
+        hostView.didMount = { [weak self] in
+            self?.hostViewDidMount()
+        }
+    }
 
-        guard AVPictureInPictureController.isPictureInPictureSupported() else {
+    var isSupported: Bool {
+        AVPictureInPictureController.isPictureInPictureSupported()
+    }
+
+    func start() {
+        installReadinessObservation()
+        startupCoordinator.requestStart()
+    }
+
+    func stop() {
+        pictureInPictureController?.stopPictureInPicture()
+        readinessObservation?.invalidate()
+        readinessObservation = nil
+        resetForNextStart()
+    }
+
+    func hostViewDidMount() {
+        guard startupCoordinator.hostDidMount() else {
+            return
+        }
+        guard isSupported else {
+            startupCoordinator.didFailToStart(errorDescription: "当前设备不支持画中画字幕。")
             return
         }
 
@@ -96,31 +103,8 @@ final class CaptionPiPController: NSObject, ObservableObject {
         let controller = AVPictureInPictureController(contentSource: source)
         controller.delegate = self
         pictureInPictureController = controller
-    }
-
-    var isSupported: Bool {
-        pictureInPictureController != nil
-    }
-
-    func start() {
-        guard let pictureInPictureController else {
-            startCoordinator.didFailToStart(errorDescription: "当前设备不支持画中画字幕。")
-            updateStartState()
-            return
-        }
-
-        let shouldStart = startCoordinator.requestStart(
-            isPossible: pictureInPictureController.isPictureInPicturePossible
-        )
-        updateStartState()
-        if shouldStart {
-            pictureInPictureController.startPictureInPicture()
-        }
-    }
-
-    func stop() {
-        pictureInPictureController?.stopPictureInPicture()
-        resetForNextStart()
+        isReadyForPictureInPicture = true
+        installReadinessObservation()
     }
 
     func render(_ snapshot: CaptionSnapshot) {
@@ -132,20 +116,10 @@ final class CaptionPiPController: NSObject, ObservableObject {
             let pixelBuffer = try renderer.makePixelBuffer(snapshot: snapshot, size: renderSize)
             try enqueue(pixelBuffer)
             lastRenderedRevision = snapshot.revision
-            if let pictureInPictureController,
-               startCoordinator.didEnqueueFrame(
-                   isPossible: pictureInPictureController.isPictureInPicturePossible
-               ) {
-                updateStartState()
-                pictureInPictureController.startPictureInPicture()
-            } else {
-                updateStartState()
-            }
         } catch {
             displayLayer.flushAndRemoveImage()
-            if startCoordinator.state == .pending {
-                startCoordinator.didFailToStart(errorDescription: "字幕画面准备失败。")
-                updateStartState()
+            if startupCoordinator.state == .pending {
+                startupCoordinator.didFailToStart(errorDescription: "字幕画面准备失败。")
             }
         }
     }
@@ -184,14 +158,29 @@ final class CaptionPiPController: NSObject, ObservableObject {
         displayLayer.enqueue(sampleBuffer)
     }
 
-    private func updateStartState() {
-        startState = startCoordinator.state
+    private func installReadinessObservation() {
+        guard let pictureInPictureController, readinessObservation == nil else {
+            return
+        }
+        readinessObservation = pictureInPictureController.observe(
+            \.isPictureInPicturePossible,
+            options: [.initial, .new]
+        ) { [weak self] controller, _ in
+            Task { @MainActor [weak self] in
+                self?.startupCoordinator.readinessDidChange(
+                    controller.isPictureInPicturePossible
+                )
+            }
+        }
     }
 
     private func resetForNextStart() {
         lastRenderedRevision = nil
-        startCoordinator.stop()
-        updateStartState()
+        startupCoordinator.stop()
+    }
+
+    deinit {
+        readinessObservation?.invalidate()
     }
 }
 
@@ -234,6 +223,8 @@ extension CaptionPiPController: AVPictureInPictureControllerDelegate {
     func pictureInPictureControllerDidStopPictureInPicture(
         _ pictureInPictureController: AVPictureInPictureController
     ) {
+        readinessObservation?.invalidate()
+        readinessObservation = nil
         resetForNextStart()
         didStop?()
     }
@@ -242,7 +233,6 @@ extension CaptionPiPController: AVPictureInPictureControllerDelegate {
         _ pictureInPictureController: AVPictureInPictureController,
         failedToStartPictureInPictureWithError error: Error
     ) {
-        startCoordinator.didFailToStart(errorDescription: error.localizedDescription)
-        updateStartState()
+        startupCoordinator.didFailToStart(errorDescription: error.localizedDescription)
     }
 }

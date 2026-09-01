@@ -53,7 +53,7 @@ struct ContentView: View {
                     Text(viewModel.latestSnapshot?.sourceText ?? "等待原文字幕")
                     Text(viewModel.latestSnapshot?.translatedText ?? "等待中文翻译")
                         .foregroundStyle(.secondary)
-                    if captionPiPController.isSupported {
+                    if captionPiPController.isReadyForPictureInPicture {
                         Button("打开画中画字幕") {
                             viewModel.startCaptionObservation()
                             captionPiPController.start()
