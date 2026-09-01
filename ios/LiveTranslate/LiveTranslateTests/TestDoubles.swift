@@ -17,3 +17,13 @@ final class InMemoryCaptionStore: CaptionStoreProtocol, @unchecked Sendable {
         lock.withLock { snapshot = nil }
     }
 }
+
+struct FakeModelPreparationService: ModelPreparing {
+    let status: ModelResourceStatus
+
+    func speechStatus(for source: SourceLanguage) async -> ModelResourceStatus {
+        status
+    }
+
+    func installSpeechModel(for source: SourceLanguage) async throws {}
+}
