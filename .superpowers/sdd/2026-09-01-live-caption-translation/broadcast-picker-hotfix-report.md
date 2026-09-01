@@ -32,3 +32,21 @@ The same focused command passed after constructing the picker with a 52 by 52 fr
 ## Remaining on-device check
 
 The iPhone needs the normal reinstall-and-open visual check to confirm that the system broadcast glyph is now visible in the App row. Extension registration was already independently verified through Control Center before this hotfix.
+
+## Fix Round 1/5: stable constructor boundary
+
+The initial test hosted the SwiftUI representable and observed it after SwiftUI layout. That did not stably prove the app-controlled construction contract: a `.zero`-constructed picker can later receive a 52 by 52 outer layout, and the internal ReplayKit button is not guaranteed to exist in every simulator configuration.
+
+The production view now exposes the smallest app-owned construction entry point, `BroadcastPickerView.makePicker()`, and `makeUIView` calls that same factory. The focused test calls the factory directly before any SwiftUI layout and asserts the real returned `RPSystemBroadcastPickerView` has exactly 52 by 52 positive finite bounds, the exact preferred extension, and `showsMicrophoneButton == false`.
+
+### Round 1 TDD evidence
+
+- RED: the focused test first failed to compile because `BroadcastPickerView.makePicker` did not exist (exit 65). This was the intended missing-factory boundary failure.
+- GREEN: after extracting the factory and routing `makeUIView` through it, the same focused test passed (exit 0).
+- Full `LiveTranslateTests`: 50 passed, 0 failed, 0 skipped.
+- Generic iphoneos build with `CODE_SIGNING_ALLOWED=NO`: passed.
+- Diff check: passed.
+
+### Diagnostic distinction
+
+The factory test's RED/GREEN contract is the constructor-time root `RPSystemBroadcastPickerView` bounds and public ReplayKit configuration. The earlier observed internal `UIButton` zero-height state is a useful real-device/simulator diagnosis of ReplayKit's reaction to a zero construction frame, but it is not a required test precondition and no longer carries the regression test's RED result.
