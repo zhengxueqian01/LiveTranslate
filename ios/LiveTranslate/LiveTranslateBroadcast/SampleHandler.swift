@@ -42,22 +42,35 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     private var audioQueue: BoundedAsyncQueue<CapturedAudioSample>?
     private var audioTask: Task<Void, Never>?
     private var silenceMonitorTask: Task<Void, Never>?
+    private var lastRecognizedText = ""
     private var isEnding = false
     private var didComplete = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String : NSObject]?) {
         do {
-            let coordinator = BroadcastCaptionCoordinator(store: try CaptionStore())
+            let captionStore = try CaptionStore()
+            let sourceStore = try SourceLanguageStore()
+            guard let source = sourceStore.load() else {
+                let coordinator = BroadcastCaptionCoordinator(store: captionStore)
+                stateLock.withLock {
+                    captionCoordinator = coordinator
+                }
+                throw BroadcastCaptureError.sourceLanguageMissing
+            }
+            let coordinator = BroadcastCaptionCoordinator(
+                translator: AppleTranslationClient(source: source),
+                store: captionStore,
+                onFailure: { [weak self] error in
+                    self?.failBroadcast(error)
+                }
+            )
             stateLock.withLock {
                 captionCoordinator = coordinator
                 clockOrigin = clock.now
                 silenceState.start(at: .zero)
+                lastRecognizedText = ""
             }
 
-            let sourceStore = try SourceLanguageStore()
-            guard let source = sourceStore.load() else {
-                throw BroadcastCaptureError.sourceLanguageMissing
-            }
             try coordinator.begin()
 
             let queue = BoundedAsyncQueue<CapturedAudioSample>(
@@ -155,11 +168,15 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
             let startedPipeline = try await SpeechPipeline.start(
                 source: source,
                 onText: { [weak self] text in
-                    do {
-                        try coordinator.updateText(text)
-                    } catch {
-                        self?.failBroadcast(error)
+                    guard let self,
+                          let timestamp = recordRecognizedText(text) else {
+                        return
                     }
+                    await coordinator.receiveRecognizedText(
+                        text,
+                        isFinal: false,
+                        timestampMilliseconds: timestamp
+                    )
                 },
                 onFailure: { [weak self] error in
                     self?.failBroadcast(error)
@@ -182,6 +199,14 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
             try Task.checkCancellation()
             try await startedPipeline.finish()
             pipeline = nil
+            if let finalUpdate = finalRecognizedText() {
+                await coordinator.receiveRecognizedText(
+                    finalUpdate.text,
+                    isFinal: true,
+                    timestampMilliseconds: finalUpdate.timestampMilliseconds
+                )
+            }
+            try await coordinator.flushPendingTranslations()
             try coordinator.stop()
             completeNormally()
         } catch is CancellationError {
@@ -243,6 +268,40 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     private func elapsedLocked() -> Duration {
         guard let clockOrigin else { return .zero }
         return clockOrigin.duration(to: clock.now)
+    }
+
+    private func recordRecognizedText(_ text: String) -> UInt64? {
+        let normalizedText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedText.isEmpty else { return nil }
+        return stateLock.withLock {
+            guard !didComplete else { return nil }
+            lastRecognizedText = normalizedText
+            return elapsedMillisecondsLocked()
+        }
+    }
+
+    private func finalRecognizedText() -> (
+        text: String,
+        timestampMilliseconds: UInt64
+    )? {
+        stateLock.withLock {
+            guard !lastRecognizedText.isEmpty else { return nil }
+            return (lastRecognizedText, elapsedMillisecondsLocked())
+        }
+    }
+
+    private func elapsedMillisecondsLocked() -> UInt64 {
+        let components = elapsedLocked().components
+        guard components.seconds >= 0 else { return 0 }
+        let seconds = UInt64(components.seconds)
+        let (milliseconds, overflow) = seconds.multipliedReportingOverflow(by: 1_000)
+        guard !overflow else { return UInt64.max }
+        let attoseconds = UInt64(max(components.attoseconds, 0))
+        let fractionalMilliseconds = attoseconds / 1_000_000_000_000_000
+        let (result, additionOverflow) = milliseconds.addingReportingOverflow(
+            fractionalMilliseconds
+        )
+        return additionOverflow ? UInt64.max : result
     }
 
     private func completeNormally() {
