@@ -58,13 +58,6 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
-		36C824193046CDFB008EAB76 /* Exceptions for "LiveTranslate" folder in "LiveTranslate" target */ = {
-			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
-			membershipExceptions = (
-				Info.plist,
-			);
-			target = 36C823DA3046CD42008EAB76 /* LiveTranslate */;
-		};
 		36C824143046CDFB008EAB76 /* Exceptions for "LiveTranslateBroadcast" folder in "LiveTranslateBroadcast" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
@@ -72,9 +65,21 @@
 			);
 			target = 36C824083046CDF9008EAB76 /* LiveTranslateBroadcast */;
 		};
+		36C824193046CDFB008EAB76 /* Exceptions for "LiveTranslate" folder in "LiveTranslate" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 36C823DA3046CD42008EAB76 /* LiveTranslate */;
+		};
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
+		36C8241A3046CDFB008EAB76 /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Shared;
+			sourceTree = "<group>";
+		};
 		36C823DD3046CD42008EAB76 /* LiveTranslate */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -140,6 +145,7 @@
 			isa = PBXGroup;
 			children = (
 				36C823DD3046CD42008EAB76 /* LiveTranslate */,
+				36C8241A3046CDFB008EAB76 /* Shared */,
 				36C823EB3046CD44008EAB76 /* LiveTranslateTests */,
 				36C823F53046CD44008EAB76 /* LiveTranslateUITests */,
 				36C8240D3046CDFB008EAB76 /* LiveTranslateBroadcast */,
@@ -186,6 +192,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				36C823DD3046CD42008EAB76 /* LiveTranslate */,
+				36C8241A3046CDFB008EAB76 /* Shared */,
 			);
 			name = LiveTranslate;
 			packageProductDependencies = (
@@ -254,6 +261,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				36C8240D3046CDFB008EAB76 /* LiveTranslateBroadcast */,
+				36C8241A3046CDFB008EAB76 /* Shared */,
 			);
 			name = LiveTranslateBroadcast;
 			packageProductDependencies = (
@@ -539,17 +547,16 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.xueqianzheng.LiveTranslate;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 6.0;
@@ -573,17 +580,16 @@
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad = "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
 				INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone = "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.xueqianzheng.LiveTranslate;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
-				SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 6.0;
@@ -683,12 +689,12 @@
 				INFOPLIST_FILE = LiveTranslateBroadcast/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = LiveTranslateBroadcast;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.xueqianzheng.LiveTranslate.BroadcastExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -712,12 +718,12 @@
 				INFOPLIST_FILE = LiveTranslateBroadcast/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = LiveTranslateBroadcast;
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.xueqianzheng.LiveTranslate.BroadcastExtension;
 				PRODUCT_NAME = "$(TARGET_NAME)";
