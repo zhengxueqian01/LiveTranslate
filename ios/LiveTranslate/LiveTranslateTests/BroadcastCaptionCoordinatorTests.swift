@@ -3,9 +3,7 @@ import XCTest
 
 final class BroadcastCaptionCoordinatorTests: XCTestCase {
     func testStaleTranslationCannotOverwriteNewerCaption() async throws {
-        let translator = DelayedFakeTranslator(
-            delays: ["first": 200_000_000, "second": 10_000_000]
-        )
+        let translator = ControlledTranslator(honorsCancellation: false)
         let store = InMemoryCaptionStore()
         let coordinator = BroadcastCaptionCoordinator(
             translator: translator,
@@ -17,15 +15,25 @@ final class BroadcastCaptionCoordinatorTests: XCTestCase {
             isFinal: true,
             timestampMilliseconds: 0
         )
+        let firstRequest = await translator.waitForRequest("first", occurrence: 1)
         await coordinator.receiveRecognizedText(
             "second",
             isFinal: true,
             timestampMilliseconds: 1
         )
-        try await Task.sleep(for: .milliseconds(250))
+        let secondRequest = await translator.waitForRequest("second", occurrence: 1)
+
+        XCTAssertTrue(translator.wasCancelled(firstRequest))
+
+        translator.succeed(secondRequest, with: "较新译文")
+        try await coordinator.flushPendingTranslations()
+        translator.succeed(firstRequest, with: "迟到旧译文")
+        await translator.waitUntilReturned(firstRequest)
+        await Task.yield()
 
         XCTAssertEqual(try store.load()?.sourceText, "second")
-        XCTAssertEqual(try store.load()?.translatedText, "译文:second")
+        XCTAssertEqual(try store.load()?.translatedText, "较新译文")
+        XCTAssertEqual(try store.load()?.phase, .recognizing)
     }
 
     func testSourceTextIsSavedBeforeTranslationCompletes() async throws {
@@ -117,6 +125,51 @@ final class BroadcastCaptionCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.translatedText, "较新译文")
         XCTAssertEqual(snapshot.phase, .recognizing)
         XCTAssertNil(snapshot.errorMessage)
+    }
+
+    func testCurrentTranslationFailureIsTerminalAndLateSuccessCannotRecover() async throws {
+        let translator = ControlledTranslator(honorsCancellation: false)
+        let store = InMemoryCaptionStore()
+        let coordinator = BroadcastCaptionCoordinator(
+            translator: translator,
+            store: store
+        )
+
+        await coordinator.receiveRecognizedText(
+            "older",
+            isFinal: true,
+            timestampMilliseconds: 0
+        )
+        let olderRequest = await translator.waitForRequest("older", occurrence: 1)
+        await coordinator.receiveRecognizedText(
+            "current",
+            isFinal: true,
+            timestampMilliseconds: 1
+        )
+        let currentRequest = await translator.waitForRequest("current", occurrence: 1)
+
+        translator.fail(currentRequest, with: .translationFailed)
+        let flushError = await capturedError {
+            try await coordinator.flushPendingTranslations()
+        }
+
+        XCTAssertTrue(flushError is TranslationTestError)
+        XCTAssertEqual(flushError?.localizedDescription, "模拟翻译失败")
+        var snapshot = try XCTUnwrap(store.load())
+        XCTAssertEqual(snapshot.sourceText, "current")
+        XCTAssertEqual(snapshot.translatedText, "")
+        XCTAssertEqual(snapshot.phase, .failed)
+        XCTAssertEqual(snapshot.errorMessage, "模拟翻译失败")
+
+        translator.succeed(olderRequest, with: "迟到旧译文")
+        await translator.waitUntilReturned(olderRequest)
+        await Task.yield()
+
+        snapshot = try XCTUnwrap(store.load())
+        XCTAssertEqual(snapshot.sourceText, "current")
+        XCTAssertEqual(snapshot.translatedText, "")
+        XCTAssertEqual(snapshot.phase, .failed)
+        XCTAssertEqual(snapshot.errorMessage, "模拟翻译失败")
     }
 
     func testFinalReplacesPendingPartialCandidateAndFlushWaitsForFinal() async throws {
@@ -312,15 +365,6 @@ final class BroadcastCaptionCoordinatorTests: XCTestCase {
         } catch {
             return error
         }
-    }
-}
-
-private struct DelayedFakeTranslator: CaptionTranslating {
-    let delays: [String: UInt64]
-
-    func translate(_ text: String) async throws -> String {
-        try await Task.sleep(nanoseconds: delays[text, default: 0])
-        return "译文:\(text)"
     }
 }
 

@@ -11,6 +11,7 @@ actor AsyncSerialExecutor {
         let operationTask = Task<Result<Value, any Error>, Never> {
             await predecessor?.value
             do {
+                try Task.checkCancellation()
                 return .success(try await operation())
             } catch {
                 return .failure(error)
@@ -20,7 +21,11 @@ actor AsyncSerialExecutor {
             _ = await operationTask.value
         }
 
-        let result = await operationTask.value
+        let result = await withTaskCancellationHandler {
+            await operationTask.value
+        } onCancel: {
+            operationTask.cancel()
+        }
         if operationGeneration == generation {
             tail = nil
         }
