@@ -59,6 +59,42 @@ final class BroadcastCaptionCoordinatorTests: XCTestCase {
         try await coordinator.flushPendingTranslations()
     }
 
+    func testLatestPartialIsTranslatedAfterRecognitionPauses() async throws {
+        let translator = ControlledTranslator()
+        let store = InMemoryCaptionStore()
+        let coordinator = BroadcastCaptionCoordinator(
+            translator: translator,
+            store: store
+        )
+
+        await coordinator.receiveRecognizedText(
+            "I just",
+            isFinal: false,
+            timestampMilliseconds: 0
+        )
+        await coordinator.receiveRecognizedText(
+            "I just want",
+            isFinal: false,
+            timestampMilliseconds: 100
+        )
+
+        let request = await translator.waitForRequest(
+            "I just want",
+            occurrence: 1,
+            timeout: .milliseconds(1_100)
+        )
+        XCTAssertNotNil(request)
+        guard let request else { return }
+
+        translator.succeed(request, with: "我只是想")
+        try await coordinator.flushPendingTranslations()
+
+        let snapshot = try XCTUnwrap(store.load())
+        XCTAssertEqual(snapshot.sourceText, "I just want")
+        XCTAssertEqual(snapshot.translatedText, "我只是想")
+        XCTAssertEqual(snapshot.phase, .recognizing)
+    }
+
     func testNewSourceImmediatelyClearsPreviousTranslationAndPreservesWarning() async throws {
         let translator = ControlledTranslator()
         let store = InMemoryCaptionStore()

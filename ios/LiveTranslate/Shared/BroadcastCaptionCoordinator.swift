@@ -5,6 +5,8 @@ protocol CaptionTranslating: Sendable {
 }
 
 final class BroadcastCaptionCoordinator: @unchecked Sendable {
+    private static let trailingTranslationDelay = Duration.milliseconds(800)
+
     private enum Lifecycle {
         case initialized
         case active
@@ -107,17 +109,31 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                     )
                 }
 
-                guard let candidate = update.translationCandidate,
-                      let translator else {
+                guard let translator else {
                     return nil
                 }
 
-                if !sourceChanged {
-                    advanceGenerationLocked()
+                let sourceText: String
+                let delay: Duration?
+                if let candidate = update.translationCandidate {
+                    if !sourceChanged {
+                        advanceGenerationLocked()
+                    }
+                    sourceText = candidate.text
+                    delay = nil
+                } else if sourceChanged {
+                    sourceText = update.displayText
+                    delay = Self.trailingTranslationDelay
+                } else {
+                    return nil
                 }
+
                 let candidateGeneration = generation
-                let task = Task { [weak self, translator, sourceText = candidate.text] in
+                let task = Task { [weak self, translator, sourceText, delay] in
                     do {
+                        if let delay {
+                            try await Task.sleep(for: delay)
+                        }
                         let translatedText = try await translator.translate(sourceText)
                         guard let self else { return }
                         let failure = self.completeTranslation(
@@ -128,6 +144,10 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                         if let failure {
                             await self.onFailure(failure)
                         }
+                    } catch is CancellationError {
+                        self?.removePendingTranslation(
+                            generation: candidateGeneration
+                        )
                     } catch {
                         guard let self else { return }
                         let failure = self.completeTranslationFailure(
