@@ -131,7 +131,7 @@ final class BroadcastCaptionCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.phase, .recognizing)
     }
 
-    func testNewSourceImmediatelyClearsPreviousTranslationAndPreservesWarning() async throws {
+    func testNewSourceAppearsImmediatelyWhilePreviousTranslationRemainsReadable() async throws {
         let translator = ControlledTranslator()
         let store = InMemoryCaptionStore()
         let coordinator = BroadcastCaptionCoordinator(
@@ -156,9 +156,26 @@ final class BroadcastCaptionCoordinatorTests: XCTestCase {
             timestampMilliseconds: 100
         )
 
-        let snapshot = try XCTUnwrap(store.load())
+        var snapshot = try XCTUnwrap(store.load())
         XCTAssertEqual(snapshot.sourceText, "second")
-        XCTAssertEqual(snapshot.translatedText, "")
+        XCTAssertEqual(snapshot.translatedText, "第一译文")
+        XCTAssertEqual(snapshot.phase, .recognizing)
+        XCTAssertEqual(snapshot.errorMessage, "来源静音")
+
+        let secondRequest = await translator.waitForRequest(
+            "second",
+            occurrence: 1,
+            timeout: .milliseconds(1_100)
+        )
+        XCTAssertNotNil(secondRequest)
+        guard let secondRequest else { return }
+
+        translator.succeed(secondRequest, with: "第二译文")
+        try await coordinator.flushPendingTranslations()
+
+        snapshot = try XCTUnwrap(store.load())
+        XCTAssertEqual(snapshot.sourceText, "second")
+        XCTAssertEqual(snapshot.translatedText, "第二译文")
         XCTAssertEqual(snapshot.phase, .recognizing)
         XCTAssertEqual(snapshot.errorMessage, "来源静音")
     }

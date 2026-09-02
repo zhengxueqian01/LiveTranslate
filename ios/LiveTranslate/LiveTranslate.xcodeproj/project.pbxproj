@@ -75,11 +75,6 @@
 /* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		36C8241A3046CDFB008EAB76 /* Shared */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			path = Shared;
-			sourceTree = "<group>";
-		};
 		36C823DD3046CD42008EAB76 /* LiveTranslate */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			exceptions = (
@@ -104,6 +99,11 @@
 				36C824143046CDFB008EAB76 /* Exceptions for "LiveTranslateBroadcast" folder in "LiveTranslateBroadcast" target */,
 			);
 			path = LiveTranslateBroadcast;
+			sourceTree = "<group>";
+		};
+		36C8241A3046CDFB008EAB76 /* Shared */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = Shared;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -539,6 +539,7 @@
 				CODE_SIGN_ENTITLEMENTS = LiveTranslate/LiveTranslate.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JMSQDWB45Z;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LiveTranslate/Info.plist;
@@ -572,6 +573,7 @@
 				CODE_SIGN_ENTITLEMENTS = LiveTranslate/LiveTranslate.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JMSQDWB45Z;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LiveTranslate/Info.plist;
@@ -685,6 +687,7 @@
 				CODE_SIGN_ENTITLEMENTS = LiveTranslateBroadcast/LiveTranslateBroadcast.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JMSQDWB45Z;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LiveTranslateBroadcast/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = LiveTranslateBroadcast;
@@ -714,6 +717,7 @@
 				CODE_SIGN_ENTITLEMENTS = LiveTranslateBroadcast/LiveTranslateBroadcast.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = JMSQDWB45Z;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = LiveTranslateBroadcast/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = LiveTranslateBroadcast;

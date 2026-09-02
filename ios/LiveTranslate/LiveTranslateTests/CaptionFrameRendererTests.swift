@@ -44,6 +44,37 @@ final class CaptionFrameRendererTests: XCTestCase {
         XCTAssertEqual(CVPixelBufferGetHeight(buffer), 320)
     }
 
+    func testRendererKeepsEndOfLongSourceTextVisible() throws {
+        let longPrefix = String(
+            repeating: "captions need to stay readable even when a sentence keeps growing ",
+            count: 5
+        )
+        let prefixBuffer = try CaptionFrameRenderer().makePixelBuffer(
+            snapshot: CaptionSnapshot(
+                revision: 1,
+                sourceText: longPrefix,
+                translatedText: "",
+                phase: .recognizing,
+                errorMessage: nil,
+                updatedAt: .now
+            ),
+            size: CGSize(width: 960, height: 320)
+        )
+        let completeBuffer = try CaptionFrameRenderer().makePixelBuffer(
+            snapshot: CaptionSnapshot(
+                revision: 2,
+                sourceText: longPrefix + "Z",
+                translatedText: "",
+                phase: .recognizing,
+                errorMessage: nil,
+                updatedAt: .now
+            ),
+            size: CGSize(width: 960, height: 320)
+        )
+
+        XCTAssertNotEqual(try pixelData(in: prefixBuffer), try pixelData(in: completeBuffer))
+    }
+
     private func countBrightPixels(in buffer: CVPixelBuffer) throws -> (
         upperHalf: Int,
         lowerHalf: Int
@@ -76,6 +107,18 @@ final class CaptionFrameRendererTests: XCTestCase {
             }
         }
         return (upperHalf, lowerHalf)
+    }
+
+    private func pixelData(in buffer: CVPixelBuffer) throws -> Data {
+        CVPixelBufferLockBaseAddress(buffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(buffer, .readOnly) }
+        guard let baseAddress = CVPixelBufferGetBaseAddress(buffer) else {
+            throw RendererTestError.missingPixelBufferBaseAddress
+        }
+        return Data(
+            bytes: baseAddress,
+            count: CVPixelBufferGetBytesPerRow(buffer) * CVPixelBufferGetHeight(buffer)
+        )
     }
 }
 

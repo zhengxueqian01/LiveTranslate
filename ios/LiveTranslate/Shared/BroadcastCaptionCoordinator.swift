@@ -107,9 +107,12 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                 let sourceChanged = previous?.sourceText != update.displayText
                 if sourceChanged {
                     advanceGenerationLocked()
+                    let hasCompletedCaption = previous.map {
+                        !$0.sourceText.isEmpty && !$0.translatedText.isEmpty
+                    } ?? false
                     try write(
                         sourceText: update.displayText,
-                        translatedText: "",
+                        translatedText: hasCompletedCaption ? nil : "",
                         phase: .recognizing,
                         errorMessage: hasSilenceWarning ? previous?.errorMessage : nil
                     )
@@ -144,6 +147,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
                         guard let self else { return }
                         let failure = self.completeTranslation(
                             translatedText,
+                            sourceText: sourceText,
                             generation: candidateGeneration
                         )
                         self.removePendingTranslation(generation: candidateGeneration)
@@ -268,6 +272,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
 
     private func completeTranslation(
         _ translatedText: String,
+        sourceText: String,
         generation candidateGeneration: UInt64
     ) -> (any Error)? {
         lock.withLock {
@@ -278,6 +283,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
             do {
                 let previous = try store.load()
                 try write(
+                    sourceText: sourceText,
                     translatedText: translatedText,
                     phase: .recognizing,
                     errorMessage: hasSilenceWarning ? previous?.errorMessage : nil

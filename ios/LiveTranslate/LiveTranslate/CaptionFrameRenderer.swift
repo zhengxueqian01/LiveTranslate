@@ -70,8 +70,22 @@ struct CaptionFrameRenderer {
         context.fill(CGRect(origin: .zero, size: size))
 
         let inset: CGFloat = 32
-        let sourceRect = CGRect(x: inset, y: 40, width: size.width - inset * 2, height: 100)
-        let translationRect = CGRect(x: inset, y: 170, width: size.width - inset * 2, height: 100)
+        let verticalInset: CGFloat = 20
+        let gap: CGFloat = 12
+        let captionHeight = (size.height - verticalInset * 2 - gap) / 2
+        let captionWidth = size.width - inset * 2
+        let sourceRect = CGRect(
+            x: inset,
+            y: verticalInset,
+            width: captionWidth,
+            height: captionHeight
+        )
+        let translationRect = CGRect(
+            x: inset,
+            y: verticalInset + captionHeight + gap,
+            width: captionWidth,
+            height: captionHeight
+        )
         let sourceColor = snapshot.phase == .failed ? UIColor.systemYellow : UIColor.white
         let translationColor = snapshot.phase == .failed ? UIColor.systemRed : UIColor.white
 
@@ -81,20 +95,74 @@ struct CaptionFrameRenderer {
         UIGraphicsPushContext(context)
         (snapshot.sourceText as NSString).draw(
             in: sourceRect,
-            withAttributes: [
-                .font: UIFont.systemFont(ofSize: 42, weight: .semibold),
-                .foregroundColor: sourceColor
-            ]
+            withAttributes: fittedAttributes(
+                for: snapshot.sourceText,
+                in: sourceRect,
+                preferredFontSize: 42,
+                minimumFontSize: 14,
+                weight: .semibold,
+                color: sourceColor
+            )
         )
-        (displayedTranslation(for: snapshot) as NSString).draw(
+        let translation = displayedTranslation(for: snapshot)
+        (translation as NSString).draw(
             in: translationRect,
-            withAttributes: [
-                .font: UIFont.systemFont(ofSize: 46, weight: .bold),
-                .foregroundColor: translationColor
-            ]
+            withAttributes: fittedAttributes(
+                for: translation,
+                in: translationRect,
+                preferredFontSize: 46,
+                minimumFontSize: 16,
+                weight: .bold,
+                color: translationColor
+            )
         )
         UIGraphicsPopContext()
         context.restoreGState()
+    }
+
+    private func fittedAttributes(
+        for text: String,
+        in rect: CGRect,
+        preferredFontSize: CGFloat,
+        minimumFontSize: CGFloat,
+        weight: UIFont.Weight,
+        color: UIColor
+    ) -> [NSAttributedString.Key: Any] {
+        let paragraphStyle = NSMutableParagraphStyle()
+        paragraphStyle.lineBreakMode = .byWordWrapping
+
+        func attributes(fontSize: CGFloat) -> [NSAttributedString.Key: Any] {
+            [
+                .font: UIFont.systemFont(ofSize: fontSize, weight: weight),
+                .foregroundColor: color,
+                .paragraphStyle: paragraphStyle
+            ]
+        }
+
+        var lowerBound = Int(minimumFontSize.rounded(.up))
+        var upperBound = Int(preferredFontSize.rounded(.down))
+        var fittedFontSize = lowerBound
+        let measurementSize = CGSize(
+            width: rect.width,
+            height: .greatestFiniteMagnitude
+        )
+        while lowerBound <= upperBound {
+            let candidate = (lowerBound + upperBound) / 2
+            let candidateAttributes = attributes(fontSize: CGFloat(candidate))
+            let bounds = (text as NSString).boundingRect(
+                with: measurementSize,
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: candidateAttributes,
+                context: nil
+            )
+            if ceil(bounds.width) <= rect.width, ceil(bounds.height) <= rect.height {
+                fittedFontSize = candidate
+                lowerBound = candidate + 1
+            } else {
+                upperBound = candidate - 1
+            }
+        }
+        return attributes(fontSize: CGFloat(fittedFontSize))
     }
 
     private func displayedTranslation(for snapshot: CaptionSnapshot) -> String {
