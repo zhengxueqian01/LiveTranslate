@@ -35,6 +35,7 @@ final class AppViewModel: ObservableObject {
     )
     @Published private(set) var preparationPhase: ModelPreparationPhase = .idle
     @Published private(set) var latestSnapshot: CaptionSnapshot?
+    @Published private(set) var reservedSpeechLocaleIdentifiers: [String] = []
     @Published private(set) var languageCatalogErrorMessage: String?
     @Published private(set) var errorMessage: String?
 
@@ -63,6 +64,10 @@ final class AppViewModel: ObservableObject {
 
     var canStartBroadcast: Bool {
         store != nil && resourceState.isReady && errorMessage == nil
+    }
+
+    var canReleaseSpeechModels: Bool {
+        preparationPhase == .idle && !isBroadcastActive
     }
 
     init(
@@ -180,6 +185,23 @@ final class AppViewModel: ObservableObject {
             return
         }
         resourceState = state
+    }
+
+    func loadReservedSpeechLocales() async {
+        reservedSpeechLocaleIdentifiers = await resourceService.reservedSpeechLocaleIdentifiers()
+    }
+
+    func releaseSpeechLocale(_ identifier: String) async {
+        guard canReleaseSpeechModels else { return }
+        guard await resourceService.releaseSpeech(localeIdentifier: identifier) else {
+            modelErrorMessage = "无法释放语音模型 \(identifier)。"
+            refreshErrorMessage()
+            return
+        }
+        await loadReservedSpeechLocales()
+        if currentConfiguration?.sourceSpeechLocaleIdentifier == identifier {
+            await refreshResourceStatus()
+        }
     }
 
     func beginModelPreparation() async -> ModelPreparationAction {
@@ -366,6 +388,15 @@ final class AppViewModel: ObservableObject {
             ?? captionErrorMessage
             ?? languageCatalogErrorMessage
             ?? modelErrorMessage
+    }
+
+    private var isBroadcastActive: Bool {
+        switch latestSnapshot?.phase {
+        case .broadcasting, .recognizing, .translating:
+            true
+        default:
+            false
+        }
     }
 }
 

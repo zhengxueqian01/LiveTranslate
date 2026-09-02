@@ -64,6 +64,9 @@ struct ContentView: View {
                 Section("本地模型") {
                     LabeledContent("语音识别", value: speechStatusText)
                     LabeledContent("翻译", value: translationStatusText)
+                    NavigationLink("模型管理") {
+                        SpeechModelManagementView(viewModel: viewModel)
+                    }
                     if let preparationStatusText {
                         Text(preparationStatusText)
                             .font(.caption)

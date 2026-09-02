@@ -2,6 +2,25 @@ import XCTest
 @testable import LiveTranslate
 
 final class BroadcastCaptionCoordinatorTests: XCTestCase {
+    func testBeginningNewBroadcastClearsPreviousCaptionText() throws {
+        let store = InMemoryCaptionStore()
+        try store.save(.init(
+            revision: 99,
+            sourceText: "old",
+            translatedText: "旧译文",
+            phase: .stopped,
+            errorMessage: nil,
+            updatedAt: .now
+        ))
+        let coordinator = BroadcastCaptionCoordinator(store: store)
+
+        try coordinator.begin()
+
+        XCTAssertEqual(try store.load()?.sourceText, "")
+        XCTAssertEqual(try store.load()?.translatedText, "")
+        XCTAssertEqual(try store.load()?.phase, .broadcasting)
+    }
+
     func testStaleTranslationCannotOverwriteNewerCaption() async throws {
         let translator = ControlledTranslator(honorsCancellation: false)
         let store = InMemoryCaptionStore()

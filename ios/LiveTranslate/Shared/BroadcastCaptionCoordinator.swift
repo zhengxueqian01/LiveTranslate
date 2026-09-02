@@ -48,6 +48,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
     func begin() throws {
         try lock.withLock {
             guard lifecycle != .terminal else { return }
+            try store.clear()
             try write(phase: .broadcasting, errorMessage: nil)
             lifecycle = .active
         }

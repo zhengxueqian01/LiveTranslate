@@ -61,6 +61,10 @@ actor RecordingLanguageResourceService: LanguageResourceManaging {
         states[pair] = state
     }
 
+    func setReservedLocales(_ identifiers: [String]) {
+        reservedLocales = identifiers
+    }
+
     func status(for pair: LanguagePairConfiguration) async -> LanguagePairResourceState {
         states[pair] ?? .init(
             speech: .init(status: .unknown, isReserved: false),
