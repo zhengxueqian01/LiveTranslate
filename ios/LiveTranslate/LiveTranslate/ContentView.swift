@@ -22,16 +22,34 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 Section("输入语言") {
-                    Picker("音频语言", selection: inputSelection) {
-                        ForEach(viewModel.inputLanguages) { option in
-                            Text(option.displayName).tag(option.localeIdentifier)
-                        }
+                    NavigationLink {
+                        LanguagePickerView(
+                            title: "音频语言",
+                            items: inputPickerItems,
+                            selection: inputSelection
+                        )
+                    } label: {
+                        selectionRow(
+                            title: "音频语言",
+                            value: viewModel.selectedInput?.displayName
+                        )
                     }
-                    Picker("目标语言", selection: outputSelection) {
-                        ForEach(viewModel.outputLanguages) { option in
-                            Text(option.displayName).tag(option.languageIdentifier)
-                        }
+                    .disabled(viewModel.inputLanguages.isEmpty)
+
+                    NavigationLink {
+                        LanguagePickerView(
+                            title: "目标语言",
+                            items: outputPickerItems,
+                            selection: outputSelection
+                        )
+                    } label: {
+                        selectionRow(
+                            title: "目标语言",
+                            value: viewModel.selectedOutput?.displayName
+                        )
                     }
+                    .disabled(viewModel.outputLanguages.isEmpty)
+
                     if viewModel.inputLanguages.isEmpty || viewModel.outputLanguages.isEmpty {
                         Text("正在读取系统支持的语言…")
                             .foregroundStyle(.secondary)
@@ -171,19 +189,42 @@ struct ContentView: View {
         }
     }
 
-    private var inputSelection: Binding<String> {
+    private var inputPickerItems: [LanguagePickerItem] {
+        viewModel.inputLanguages.map {
+            LanguagePickerItem(id: $0.localeIdentifier, title: $0.displayName)
+        }
+    }
+
+    private var outputPickerItems: [LanguagePickerItem] {
+        viewModel.outputLanguages.map {
+            LanguagePickerItem(id: $0.languageIdentifier, title: $0.displayName)
+        }
+    }
+
+    private func selectionRow(title: String, value: String?) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            Text(value ?? "未选择")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var inputSelection: Binding<String?> {
         Binding(
-            get: { viewModel.selectedInput?.localeIdentifier ?? "" },
+            get: { viewModel.selectedInput?.localeIdentifier },
             set: { identifier in
+                guard let identifier else { return }
                 Task { await viewModel.selectInput(identifier: identifier) }
             }
         )
     }
 
-    private var outputSelection: Binding<String> {
+    private var outputSelection: Binding<String?> {
         Binding(
-            get: { viewModel.selectedOutput?.languageIdentifier ?? "" },
+            get: { viewModel.selectedOutput?.languageIdentifier },
             set: { identifier in
+                guard let identifier else { return }
                 Task { await viewModel.selectOutput(identifier: identifier) }
             }
         )
