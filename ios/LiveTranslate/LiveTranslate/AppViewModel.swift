@@ -2,14 +2,6 @@ import Combine
 import Foundation
 import SwiftUI
 
-enum ModelResourceStatus: Equatable, Sendable {
-    case unknown
-    case unsupported
-    case needsDownload
-    case downloading
-    case installed
-}
-
 protocol ModelPreparing: Sendable {
     func speechStatus(for source: SourceLanguage) async -> ModelResourceStatus
     func installSpeechModel(for source: SourceLanguage) async throws

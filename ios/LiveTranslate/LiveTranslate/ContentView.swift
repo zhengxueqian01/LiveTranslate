@@ -150,6 +150,8 @@ struct ContentView: View {
             "下载中"
         case .installed:
             "已安装"
+        case .notRequired:
+            "无需翻译"
         }
     }
 
