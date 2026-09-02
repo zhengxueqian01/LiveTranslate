@@ -21,6 +21,23 @@ final class BroadcastCaptionCoordinatorTests: XCTestCase {
         XCTAssertEqual(try store.load()?.phase, .broadcasting)
     }
 
+    func testBeginningNewBroadcastKeepsRevisionMonotonicAfterClearingSnapshot() throws {
+        let store = InMemoryCaptionStore()
+        try store.save(.init(
+            revision: 99,
+            sourceText: "old",
+            translatedText: "旧译文",
+            phase: .stopped,
+            errorMessage: nil,
+            updatedAt: .now
+        ))
+        let coordinator = BroadcastCaptionCoordinator(store: store)
+
+        try coordinator.begin()
+
+        XCTAssertEqual(try store.load()?.revision, 100)
+    }
+
     func testStaleTranslationCannotOverwriteNewerCaption() async throws {
         let translator = ControlledTranslator(honorsCancellation: false)
         let store = InMemoryCaptionStore()

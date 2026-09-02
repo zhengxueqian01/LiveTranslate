@@ -48,8 +48,13 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
     func begin() throws {
         try lock.withLock {
             guard lifecycle != .terminal else { return }
+            let previousRevision = try store.load()?.revision ?? 0
             try store.clear()
-            try write(phase: .broadcasting, errorMessage: nil)
+            try write(
+                phase: .broadcasting,
+                errorMessage: nil,
+                revision: previousRevision + 1
+            )
             lifecycle = .active
         }
     }
@@ -321,12 +326,13 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
         sourceText: String? = nil,
         translatedText: String? = nil,
         phase: SessionPhase,
-        errorMessage: String?
+        errorMessage: String?,
+        revision: UInt64? = nil
     ) throws {
         let previous = try store.load()
         try store.save(
             CaptionSnapshot(
-                revision: (previous?.revision ?? 0) + 1,
+                revision: revision ?? (previous?.revision ?? 0) + 1,
                 sourceText: sourceText ?? previous?.sourceText ?? "",
                 translatedText: translatedText ?? previous?.translatedText ?? "",
                 phase: phase,

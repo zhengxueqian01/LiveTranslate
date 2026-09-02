@@ -46,12 +46,14 @@ final class AppViewModel: ObservableObject {
     private let displayLocale: Locale
     private let storageErrorMessage: String?
     private var modelErrorMessage: String?
+    private var releaseErrorMessage: String?
     private var captionErrorMessage: String?
     private var captionObservationTask: Task<Void, Never>?
     private var requestGeneration: UInt64 = 0
     private var selectionGeneration: UInt64 = 0
     private var translationPreparationGeneration: UInt64 = 0
     private var activeTranslationPreparation: TranslationPreparationRequest?
+    private var isReleasingSpeechModel = false
 
     var currentConfiguration: LanguagePairConfiguration? {
         guard let selectedInput, let selectedOutput else { return nil }
@@ -67,7 +69,10 @@ final class AppViewModel: ObservableObject {
     }
 
     var canReleaseSpeechModels: Bool {
-        preparationPhase == .idle && !isBroadcastActive
+        store != nil
+            && preparationPhase == .idle
+            && !isReleasingSpeechModel
+            && !isBroadcastActive
     }
 
     init(
@@ -86,6 +91,7 @@ final class AppViewModel: ObservableObject {
             ? "无法打开 App Group，请检查两个 Target 的签名与 App Group 配置。"
             : nil
         modelErrorMessage = nil
+        releaseErrorMessage = nil
         captionErrorMessage = nil
         captionObservationTask = nil
         languageCatalogErrorMessage = nil
@@ -192,12 +198,31 @@ final class AppViewModel: ObservableObject {
     }
 
     func releaseSpeechLocale(_ identifier: String) async {
-        guard canReleaseSpeechModels else { return }
+        guard preparationPhase == .idle,
+              !isReleasingSpeechModel,
+              !isBroadcastActive,
+              let store else {
+            return
+        }
+        isReleasingSpeechModel = true
+        defer { isReleasingSpeechModel = false }
+
+        let sharedSnapshot: CaptionSnapshot?
+        do {
+            sharedSnapshot = try store.load()
+        } catch {
+            return
+        }
+        guard !Self.isBroadcastActive(sharedSnapshot?.phase) else {
+            return
+        }
         guard await resourceService.releaseSpeech(localeIdentifier: identifier) else {
-            modelErrorMessage = "无法释放语音模型 \(identifier)。"
+            releaseErrorMessage = "无法释放语音模型 \(identifier)。"
             refreshErrorMessage()
             return
         }
+        releaseErrorMessage = nil
+        refreshErrorMessage()
         await loadReservedSpeechLocales()
         if currentConfiguration?.sourceSpeechLocaleIdentifier == identifier {
             await refreshResourceStatus()
@@ -205,7 +230,8 @@ final class AppViewModel: ObservableObject {
     }
 
     func beginModelPreparation() async -> ModelPreparationAction {
-        guard preparationPhase == .idle,
+        guard !isReleasingSpeechModel,
+              preparationPhase == .idle,
               let request = currentConfiguration,
               resourceState.speech.status != .unknown,
               resourceState.speech.status != .unsupported,
@@ -388,10 +414,15 @@ final class AppViewModel: ObservableObject {
             ?? captionErrorMessage
             ?? languageCatalogErrorMessage
             ?? modelErrorMessage
+            ?? releaseErrorMessage
     }
 
     private var isBroadcastActive: Bool {
-        switch latestSnapshot?.phase {
+        Self.isBroadcastActive(latestSnapshot?.phase)
+    }
+
+    private static func isBroadcastActive(_ phase: SessionPhase?) -> Bool {
+        switch phase {
         case .broadcasting, .recognizing, .translating:
             true
         default:
