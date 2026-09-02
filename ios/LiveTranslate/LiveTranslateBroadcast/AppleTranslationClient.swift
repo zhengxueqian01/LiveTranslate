@@ -2,41 +2,44 @@ import Foundation
 @preconcurrency import Translation
 
 enum AppleTranslationClientError: LocalizedError, Sendable {
-    case languageResourcesNotInstalled
-    case unsupportedLanguagePair
-    case translationFailed(String)
+    case languageResourcesNotInstalled(source: String, target: String)
+    case unsupportedLanguagePair(source: String, target: String)
+    case translationFailed(source: String, target: String, message: String)
 
     var errorDescription: String? {
         switch self {
-        case .languageResourcesNotInstalled:
-            "本机尚未安装当前来源语言到简体中文的翻译资源，请返回主 App 完成模型准备。"
-        case .unsupportedLanguagePair:
-            "系统不支持当前来源语言到简体中文的端侧翻译。"
-        case .translationFailed(let message):
-            "端侧翻译失败：\(message)"
+        case .languageResourcesNotInstalled(let source, let target):
+            "本机尚未安装 \(source) 到 \(target) 的翻译资源，请返回主 App 完成模型准备。"
+        case .unsupportedLanguagePair(let source, let target):
+            "系统不支持 \(source) 到 \(target) 的端侧翻译。"
+        case .translationFailed(let source, let target, let message):
+            "\(source) 到 \(target) 的端侧翻译失败：\(message)"
         }
     }
 }
 
 actor AppleTranslationClient: CaptionTranslating {
+    private let configuration: TranslationClientConfiguration
     private let source: Locale.Language
-    private let target = SourceLanguage.translationTarget
+    private let target: Locale.Language
     private let session: TranslationSession
     private let serialExecutor = AsyncSerialExecutor()
     private var didVerifyResources = false
 
-    init(source: SourceLanguage) {
-        self.source = source.translationSource
+    init(configuration: TranslationClientConfiguration) {
+        self.configuration = configuration
+        source = Locale.Language(identifier: configuration.sourceIdentifier)
+        target = Locale.Language(identifier: configuration.targetIdentifier)
         if #available(iOS 26.4, *) {
             session = TranslationSession(
-                installedSource: source.translationSource,
-                target: SourceLanguage.translationTarget,
+                installedSource: source,
+                target: target,
                 preferredStrategy: .lowLatency
             )
         } else {
             session = TranslationSession(
-                installedSource: source.translationSource,
-                target: SourceLanguage.translationTarget
+                installedSource: source,
+                target: target
             )
         }
     }
@@ -56,10 +59,15 @@ actor AppleTranslationClient: CaptionTranslating {
         do {
             return try await session.translate(text).targetText
         } catch let error where TranslationError.notInstalled ~= error {
-            throw AppleTranslationClientError.languageResourcesNotInstalled
+            throw AppleTranslationClientError.languageResourcesNotInstalled(
+                source: configuration.sourceIdentifier,
+                target: configuration.targetIdentifier
+            )
         } catch {
             throw AppleTranslationClientError.translationFailed(
-                error.localizedDescription
+                source: configuration.sourceIdentifier,
+                target: configuration.targetIdentifier,
+                message: error.localizedDescription
             )
         }
     }
@@ -76,12 +84,20 @@ actor AppleTranslationClient: CaptionTranslating {
         case .installed:
             return
         case .supported:
-            throw AppleTranslationClientError.languageResourcesNotInstalled
+            throw AppleTranslationClientError.languageResourcesNotInstalled(
+                source: configuration.sourceIdentifier,
+                target: configuration.targetIdentifier
+            )
         case .unsupported:
-            throw AppleTranslationClientError.unsupportedLanguagePair
+            throw AppleTranslationClientError.unsupportedLanguagePair(
+                source: configuration.sourceIdentifier,
+                target: configuration.targetIdentifier
+            )
         @unknown default:
             throw AppleTranslationClientError.translationFailed(
-                "系统返回未知的语言资源状态。"
+                source: configuration.sourceIdentifier,
+                target: configuration.targetIdentifier,
+                message: "系统返回未知的语言资源状态。"
             )
         }
     }

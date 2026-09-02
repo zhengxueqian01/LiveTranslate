@@ -2,11 +2,6 @@ import Combine
 import Foundation
 import SwiftUI
 
-protocol ModelPreparing: Sendable {
-    func speechStatus(for source: SourceLanguage) async -> ModelResourceStatus
-    func installSpeechModel(for source: SourceLanguage) async throws
-}
-
 enum ModelPreparationAction: Equatable, Sendable {
     case none
     case prepareTranslation(TranslationPreparationRequest)

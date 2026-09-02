@@ -10,14 +10,14 @@ import Foundation
 import ReplayKit
 
 enum BroadcastCaptureError: LocalizedError {
-    case sourceLanguageMissing
+    case languageConfigurationMissing
     case audioQueueDropped
     case audioQueueTerminated
 
     var errorDescription: String? {
         switch self {
-        case .sourceLanguageMissing:
-            "未找到来源语言，请返回主 App 选择语言后重新开始直播。"
+        case .languageConfigurationMissing:
+            "未找到语言配置，请返回主 App 选择输入与输出语言后重新开始直播。"
         case .audioQueueDropped:
             "App 音频处理速度不足，启动或运行队列已满。"
         case .audioQueueTerminated:
@@ -49,16 +49,21 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     override func broadcastStarted(withSetupInfo setupInfo: [String : NSObject]?) {
         do {
             let captionStore = try CaptionStore()
-            let sourceStore = try SourceLanguageStore()
-            guard let source = sourceStore.load() else {
+            let configurationStore = try LanguageConfigurationStore()
+            guard let configuration = configurationStore.load() else {
                 let coordinator = BroadcastCaptionCoordinator(store: captionStore)
                 stateLock.withLock {
                     captionCoordinator = coordinator
                 }
-                throw BroadcastCaptureError.sourceLanguageMissing
+                throw BroadcastCaptureError.languageConfigurationMissing
             }
+            let translator: any CaptionTranslating = configuration.usesPassThroughTranslation
+                ? PassThroughTranslationClient()
+                : AppleTranslationClient(
+                    configuration: TranslationClientConfiguration(configuration)
+                )
             let coordinator = BroadcastCaptionCoordinator(
-                translator: AppleTranslationClient(source: source),
+                translator: translator,
                 store: captionStore,
                 onFailure: { [weak self] error in
                     self?.failBroadcast(error)
@@ -78,7 +83,7 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
             )
             let sessionTask = Task { [weak self] in
                 _ = await self?.runAudioSession(
-                    source: source,
+                    sourceLocaleIdentifier: configuration.sourceSpeechLocaleIdentifier,
                     queue: queue,
                     coordinator: coordinator
                 )
@@ -159,14 +164,14 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     }
 
     private func runAudioSession(
-        source: SourceLanguage,
+        sourceLocaleIdentifier: String,
         queue: BoundedAsyncQueue<CapturedAudioSample>,
         coordinator: BroadcastCaptionCoordinator
     ) async {
         var pipeline: SpeechPipeline?
         do {
             let startedPipeline = try await SpeechPipeline.start(
-                source: source,
+                sourceLocaleIdentifier: sourceLocaleIdentifier,
                 onText: { [weak self] text in
                     guard let self,
                           let timestamp = recordRecognizedText(text) else {

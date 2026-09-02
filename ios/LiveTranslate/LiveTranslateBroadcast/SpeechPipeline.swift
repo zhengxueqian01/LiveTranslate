@@ -120,12 +120,12 @@ actor SpeechPipeline {
     }
 
     static func start(
-        source: SourceLanguage,
+        sourceLocaleIdentifier: String,
         onText: @escaping @Sendable (String) async -> Void,
         onFailure: @escaping @Sendable (any Error) async -> Void = { _ in }
     ) async throws -> SpeechPipeline {
         let transcriber = SpeechTranscriber(
-            locale: source.speechLocale,
+            locale: Locale(identifier: sourceLocaleIdentifier),
             preset: .progressiveTranscription
         )
         let modules: [any SpeechModule] = [transcriber]
