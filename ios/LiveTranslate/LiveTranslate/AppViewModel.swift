@@ -309,13 +309,19 @@ final class AppViewModel: ObservableObject {
         for request: TranslationPreparationRequest,
         error: (any Error)?
     ) async {
+        let generation = selectionGeneration
+        let configuration = request.configuration
         guard request == activeTranslationPreparation,
-              request.configuration == currentConfiguration else {
+              configuration == currentConfiguration else {
             return
         }
         activeTranslationPreparation = nil
         preparationPhase = .idle
         await refreshResourceStatus()
+        guard generation == selectionGeneration,
+              configuration == currentConfiguration else {
+            return
+        }
         modelErrorMessage = resourceState.isReady
             ? nil
             : error.map { "翻译模型准备失败：\($0.localizedDescription)" }

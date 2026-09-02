@@ -388,6 +388,73 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertNil(viewModel.errorMessage)
     }
 
+    func testStaleTranslationCompletionAfterRefreshDoesNotBlockNewSelection() async {
+        let chinese = TranslationLanguageOption(
+            languageIdentifier: "zh-Hans",
+            displayName: "简体中文"
+        )
+        let chinesePair = LanguagePairConfiguration(
+            sourceSpeechLocaleIdentifier: "fr-FR",
+            sourceTranslationLanguageIdentifier: "fr",
+            targetTranslationLanguageIdentifier: "zh-Hans"
+        )
+        let needsTranslation = LanguagePairResourceState(
+            speech: .init(status: .installed, isReserved: true),
+            translation: .needsDownload
+        )
+        let resources = ControlledLanguageResourceService()
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(
+                snapshot: .init(
+                    inputLanguages: [LanguageTestFixture.input],
+                    outputLanguages: [LanguageTestFixture.output, chinese]
+                )
+            ),
+            resourceService: resources,
+            store: InMemoryCaptionStore(),
+            languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        let loading = Task { await viewModel.loadLanguages() }
+        await resources.waitForStatusRequest(for: LanguageTestFixture.pair)
+        await resources.resolveStatus(for: LanguageTestFixture.pair, with: needsTranslation)
+        await loading.value
+
+        let preparation = Task { await viewModel.beginModelPreparation() }
+        await resources.waitForStatusRequest(for: LanguageTestFixture.pair)
+        await resources.resolveStatus(for: LanguageTestFixture.pair, with: needsTranslation)
+        guard case .prepareTranslation(let request) = await preparation.value else {
+            XCTFail("Expected a translation preparation request")
+            return
+        }
+
+        let completion = Task {
+            await viewModel.finishTranslationPreparation(
+                for: request,
+                error: ModelPreparationTestError.installationFailed
+            )
+        }
+        await resources.waitForStatusRequest(for: LanguageTestFixture.pair)
+
+        let selection = Task { await viewModel.selectOutput(identifier: "zh-Hans") }
+        await resources.waitForStatusRequest(for: chinesePair)
+        await resources.resolveStatus(for: LanguageTestFixture.pair, with: needsTranslation)
+        await completion.value
+
+        XCTAssertEqual(viewModel.currentConfiguration, chinesePair)
+        XCTAssertEqual(viewModel.preparationPhase, .idle)
+        XCTAssertNil(viewModel.errorMessage)
+
+        await resources.resolveStatus(
+            for: chinesePair,
+            with: .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .installed
+            )
+        )
+        await selection.value
+    }
+
     func testOldTranslationCompletionForSamePairCannotAffectNewPreparation() async {
         let chinese = TranslationLanguageOption(languageIdentifier: "zh-Hans", displayName: "简体中文")
         let chinesePair = LanguagePairConfiguration(

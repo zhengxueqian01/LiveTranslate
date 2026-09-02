@@ -78,59 +78,40 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
             guard let configuration = configurationStore.load() else {
                 throw BroadcastCaptureError.languageConfigurationMissing
             }
-            let resources = try await BroadcastStartupPreparer(
-                checker: SystemBroadcastInstalledResourceChecker(),
-                translationClientBuilder: AppleTranslationClientBuilder()
-            ).prepare(configuration: configuration)
-            try Task.checkCancellation()
-
-            let coordinator = BroadcastCaptionCoordinator(
-                translator: resources.translator,
-                store: captionStore,
-                onFailure: { [weak self] error in
-                    self?.failBroadcast(error)
+            let session = try await BroadcastStartupOrchestrator(
+                preparer: .init(
+                    checker: SystemBroadcastInstalledResourceChecker(),
+                    translationClientBuilder: AppleTranslationClientBuilder()
+                ),
+                makeCoordinator: { [weak self] _, translator in
+                    BroadcastCaptionCoordinator(
+                        translator: translator,
+                        store: captionStore,
+                        onFailure: { [weak self] error in
+                            self?.failBroadcast(error)
+                        }
+                    )
+                }
+            ).start(
+                configuration: configuration,
+                beforeBeginning: { [weak self] in
+                    guard let self else {
+                        throw CancellationError()
+                    }
+                    try self.stateLock.withLock {
+                        guard !self.didComplete, !self.isEnding, !Task.isCancelled else {
+                            throw CancellationError()
+                        }
+                    }
+                },
+                acceptAudio: { [weak self] session in
+                    guard let self else {
+                        throw CancellationError()
+                    }
+                    try self.acceptAudio(for: session)
                 }
             )
-            try stateLock.withLock {
-                guard !didComplete, !isEnding, !Task.isCancelled else {
-                    throw CancellationError()
-                }
-                try coordinator.begin()
-                captionCoordinator = coordinator
-                clockOrigin = clock.now
-                silenceState.start(at: .zero)
-                lastRecognizedText = ""
-            }
-            startedCoordinator = coordinator
-            try Task.checkCancellation()
-
-            let queue = BoundedAsyncQueue<CapturedAudioSample>(
-                capacity: Self.audioQueueCapacity
-            )
-            let sessionTask = Task { [weak self] in
-                _ = await self?.runAudioSession(
-                    sourceLocaleIdentifier: resources.sourceSpeechLocaleIdentifier,
-                    queue: queue,
-                    coordinator: coordinator
-                )
-            }
-            let monitorTask = makeSilenceMonitor(coordinator: coordinator)
-            let shouldCancel = stateLock.withLock {
-                guard !didComplete, !isEnding, !Task.isCancelled else {
-                    return true
-                }
-                audioQueue = queue
-                startupTask = nil
-                audioTask = sessionTask
-                silenceMonitorTask = monitorTask
-                return false
-            }
-            if shouldCancel {
-                queue.finish()
-                sessionTask.cancel()
-                monitorTask.cancel()
-                throw CancellationError()
-            }
+            startedCoordinator = session.coordinator
         } catch is CancellationError {
             try? startedCoordinator?.stop()
             completeNormally()
@@ -201,6 +182,48 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
             }
         } catch {
             failBroadcast(error)
+        }
+    }
+
+    private func acceptAudio(for session: BroadcastStartupSession) throws {
+        let coordinator = session.coordinator
+        try stateLock.withLock {
+            guard !didComplete, !isEnding, !Task.isCancelled else {
+                throw CancellationError()
+            }
+            captionCoordinator = coordinator
+            clockOrigin = clock.now
+            silenceState.start(at: .zero)
+            lastRecognizedText = ""
+        }
+        try Task.checkCancellation()
+
+        let queue = BoundedAsyncQueue<CapturedAudioSample>(
+            capacity: Self.audioQueueCapacity
+        )
+        let sessionTask = Task { [weak self] in
+            _ = await self?.runAudioSession(
+                sourceLocaleIdentifier: session.sourceSpeechLocaleIdentifier,
+                queue: queue,
+                coordinator: coordinator
+            )
+        }
+        let monitorTask = makeSilenceMonitor(coordinator: coordinator)
+        let shouldCancel = stateLock.withLock {
+            guard !didComplete, !isEnding, !Task.isCancelled else {
+                return true
+            }
+            audioQueue = queue
+            startupTask = nil
+            audioTask = sessionTask
+            silenceMonitorTask = monitorTask
+            return false
+        }
+        if shouldCancel {
+            queue.finish()
+            sessionTask.cancel()
+            monitorTask.cancel()
+            throw CancellationError()
         }
     }
 
