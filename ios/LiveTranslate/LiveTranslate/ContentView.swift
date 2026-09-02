@@ -11,7 +11,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var viewModel: AppViewModel
     @State private var translationConfiguration: TranslationSession.Configuration?
-    @State private var translationPreparation: LanguagePairConfiguration?
+    @State private var translationPreparation: TranslationPreparationRequest?
     @StateObject private var captionPiPController = CaptionPiPController()
 
     init(viewModel: AppViewModel? = nil) {
@@ -54,10 +54,11 @@ struct ContentView: View {
                     if viewModel.currentConfiguration != nil, !viewModel.resourceState.isReady {
                         Button("下载所需模型") {
                             Task {
-                                guard case .prepareTranslation(let pair) = await viewModel.beginModelPreparation() else {
+                                guard case .prepareTranslation(let request) = await viewModel.beginModelPreparation() else {
                                     return
                                 }
-                                translationPreparation = pair
+                                let pair = request.configuration
+                                translationPreparation = request
                                 if #available(iOS 26.4, *) {
                                     translationConfiguration = TranslationSession.Configuration(
                                         source: Locale.Language(
@@ -157,12 +158,12 @@ struct ContentView: View {
                 captionPiPController.stop()
             }
             .translationTask(translationConfiguration) { session in
-                guard let pair = translationPreparation else { return }
+                guard let request = translationPreparation else { return }
                 do {
                     try await session.prepareTranslation()
-                    await viewModel.finishTranslationPreparation(for: pair, error: nil)
+                    await viewModel.finishTranslationPreparation(for: request, error: nil)
                 } catch {
-                    await viewModel.finishTranslationPreparation(for: pair, error: error)
+                    await viewModel.finishTranslationPreparation(for: request, error: error)
                 }
                 translationPreparation = nil
                 translationConfiguration = nil

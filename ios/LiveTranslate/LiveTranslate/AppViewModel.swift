@@ -9,7 +9,12 @@ protocol ModelPreparing: Sendable {
 
 enum ModelPreparationAction: Equatable, Sendable {
     case none
-    case prepareTranslation(LanguagePairConfiguration)
+    case prepareTranslation(TranslationPreparationRequest)
+}
+
+struct TranslationPreparationRequest: Equatable, Sendable {
+    let configuration: LanguagePairConfiguration
+    let token: UInt64
 }
 
 enum ModelPreparationPhase: Equatable, Sendable {
@@ -44,6 +49,8 @@ final class AppViewModel: ObservableObject {
     private var captionObservationTask: Task<Void, Never>?
     private var requestGeneration: UInt64 = 0
     private var selectionGeneration: UInt64 = 0
+    private var translationPreparationGeneration: UInt64 = 0
+    private var activeTranslationPreparation: TranslationPreparationRequest?
 
     var currentConfiguration: LanguagePairConfiguration? {
         guard let selectedInput, let selectedOutput else { return nil }
@@ -106,6 +113,7 @@ final class AppViewModel: ObservableObject {
         selectedOutput = nil
         resourceState = Self.unknownResourceState
         preparationPhase = .idle
+        activeTranslationPreparation = nil
         languageCatalogErrorMessage = nil
         modelErrorMessage = nil
         refreshErrorMessage()
@@ -177,7 +185,9 @@ final class AppViewModel: ObservableObject {
     func beginModelPreparation() async -> ModelPreparationAction {
         guard preparationPhase == .idle,
               let request = currentConfiguration,
+              resourceState.speech.status != .unknown,
               resourceState.speech.status != .unsupported,
+              resourceState.translation != .unknown,
               resourceState.translation != .unsupported else {
             return .none
         }
@@ -199,15 +209,23 @@ final class AppViewModel: ObservableObject {
                 return .none
             }
             if resourceState.translation == .needsDownload {
+                translationPreparationGeneration &+= 1
+                let translationRequest = TranslationPreparationRequest(
+                    configuration: request,
+                    token: translationPreparationGeneration
+                )
+                activeTranslationPreparation = translationRequest
                 preparationPhase = .preparingTranslation
-                return .prepareTranslation(request)
+                return .prepareTranslation(translationRequest)
             }
+            activeTranslationPreparation = nil
             preparationPhase = .idle
             return .none
         } catch {
             guard generation == selectionGeneration, request == currentConfiguration else {
                 return .none
             }
+            activeTranslationPreparation = nil
             preparationPhase = .idle
             modelErrorMessage = "模型准备失败：\(error.localizedDescription)"
             refreshErrorMessage()
@@ -216,10 +234,14 @@ final class AppViewModel: ObservableObject {
     }
 
     func finishTranslationPreparation(
-        for configuration: LanguagePairConfiguration,
+        for request: TranslationPreparationRequest,
         error: (any Error)?
     ) async {
-        guard configuration == currentConfiguration else { return }
+        guard request == activeTranslationPreparation,
+              request.configuration == currentConfiguration else {
+            return
+        }
+        activeTranslationPreparation = nil
         preparationPhase = .idle
         modelErrorMessage = error.map { "翻译模型准备失败：\($0.localizedDescription)" }
         await refreshResourceStatus()
@@ -286,6 +308,7 @@ final class AppViewModel: ObservableObject {
     private func selectionDidChange() {
         selectionGeneration &+= 1
         preparationPhase = .idle
+        activeTranslationPreparation = nil
         resourceState = Self.unknownResourceState
         modelErrorMessage = nil
         refreshErrorMessage()

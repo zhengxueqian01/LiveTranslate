@@ -111,7 +111,29 @@ final class AppViewModelTests: XCTestCase {
 
         let preparedSpeechLocales = await resources.preparedSpeechLocales
         XCTAssertEqual(preparedSpeechLocales, ["fr-FR"])
-        XCTAssertEqual(action, .prepareTranslation(LanguageTestFixture.pair))
+        guard case .prepareTranslation(let request) = action else {
+            XCTFail("Expected a translation preparation request")
+            return
+        }
+        XCTAssertEqual(request.configuration, LanguageTestFixture.pair)
+    }
+
+    func testUnknownPairStatusCannotPrepareSpeech() async {
+        let resources = RecordingLanguageResourceService()
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: resources,
+            store: InMemoryCaptionStore(),
+            languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        await viewModel.loadLanguages()
+
+        let action = await viewModel.beginModelPreparation()
+
+        let preparedSpeechLocales = await resources.preparedSpeechLocales
+        XCTAssertEqual(action, .none)
+        XCTAssertEqual(preparedSpeechLocales, [])
     }
 
     func testUnsupportedPairCannotPrepareOrBroadcast() async {
@@ -297,26 +319,90 @@ final class AppViewModelTests: XCTestCase {
 
     func testOldTranslationCompletionDoesNotOverwriteCurrentPair() async {
         let chinese = TranslationLanguageOption(languageIdentifier: "zh-Hans", displayName: "简体中文")
+        let resources = RecordingLanguageResourceService()
+        await resources.setState(
+            .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .needsDownload
+            ),
+            for: LanguageTestFixture.pair
+        )
         let catalog = LanguageCatalogSnapshot(
             inputLanguages: [LanguageTestFixture.input],
             outputLanguages: [LanguageTestFixture.output, chinese]
         )
         let viewModel = AppViewModel(
             catalogService: FixedLanguageCatalogService(snapshot: catalog),
-            resourceService: RecordingLanguageResourceService(),
+            resourceService: resources,
             store: InMemoryCaptionStore(),
             languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
             displayLocale: Locale(identifier: "zh-Hans")
         )
         await viewModel.loadLanguages()
+        let action = await viewModel.beginModelPreparation()
+        guard case .prepareTranslation(let request) = action else {
+            XCTFail("Expected a translation preparation request")
+            return
+        }
         await viewModel.selectOutput(identifier: "zh-Hans")
 
         await viewModel.finishTranslationPreparation(
-            for: LanguageTestFixture.pair,
+            for: request,
             error: ModelPreparationTestError.installationFailed
         )
 
         XCTAssertNil(viewModel.errorMessage)
+    }
+
+    func testOldTranslationCompletionForSamePairCannotAffectNewPreparation() async {
+        let chinese = TranslationLanguageOption(languageIdentifier: "zh-Hans", displayName: "简体中文")
+        let chinesePair = LanguagePairConfiguration(
+            sourceSpeechLocaleIdentifier: "fr-FR",
+            sourceTranslationLanguageIdentifier: "fr",
+            targetTranslationLanguageIdentifier: "zh-Hans"
+        )
+        let catalog = LanguageCatalogSnapshot(
+            inputLanguages: [LanguageTestFixture.input],
+            outputLanguages: [LanguageTestFixture.output, chinese]
+        )
+        let resources = RecordingLanguageResourceService()
+        let needsTranslation = LanguagePairResourceState(
+            speech: .init(status: .installed, isReserved: true),
+            translation: .needsDownload
+        )
+        await resources.setState(needsTranslation, for: LanguageTestFixture.pair)
+        await resources.setState(needsTranslation, for: chinesePair)
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: catalog),
+            resourceService: resources,
+            store: InMemoryCaptionStore(),
+            languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        await viewModel.loadLanguages()
+
+        let oldAction = await viewModel.beginModelPreparation()
+        guard case .prepareTranslation(let oldRequest) = oldAction else {
+            XCTFail("Expected the old translation preparation request")
+            return
+        }
+        await viewModel.selectOutput(identifier: "zh-Hans")
+        await viewModel.selectOutput(identifier: "de")
+        let newAction = await viewModel.beginModelPreparation()
+        guard case .prepareTranslation(let newRequest) = newAction else {
+            XCTFail("Expected the new translation preparation request")
+            return
+        }
+        XCTAssertNotEqual(oldRequest.token, newRequest.token)
+
+        await viewModel.finishTranslationPreparation(
+            for: oldRequest,
+            error: ModelPreparationTestError.installationFailed
+        )
+
+        XCTAssertEqual(viewModel.preparationPhase, .preparingTranslation)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertEqual(viewModel.resourceState, needsTranslation)
     }
 
     func testStorageFailureRetainsPriorityOverTranslationFailure() async {
@@ -333,9 +419,14 @@ final class AppViewModelTests: XCTestCase {
             displayLocale: Locale(identifier: "zh-Hans")
         )
         await viewModel.loadLanguages()
+        let action = await viewModel.beginModelPreparation()
+        guard case .prepareTranslation(let request) = action else {
+            XCTFail("Expected a translation preparation request")
+            return
+        }
 
         await viewModel.finishTranslationPreparation(
-            for: LanguageTestFixture.pair,
+            for: request,
             error: ModelPreparationTestError.installationFailed
         )
 
