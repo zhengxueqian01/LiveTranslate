@@ -173,24 +173,47 @@ final class AppViewModel: ObservableObject {
         }
     }
 
-    func selectInput(identifier: String) async {
-        guard let option = inputLanguages.first(where: { $0.localeIdentifier == identifier }) else {
+    func loadLanguagesIfNeeded() async {
+        guard inputLanguages.isEmpty || outputLanguages.isEmpty else {
             return
         }
-        selectedInput = option
-        selectionDidChange()
-        persistCurrentConfiguration()
+        await loadLanguages()
+    }
+
+    func selectInput(identifier: String) async {
+        guard setInputSelection(identifier: identifier) else {
+            return
+        }
         await refreshResourceStatus()
     }
 
     func selectOutput(identifier: String) async {
-        guard let option = outputLanguages.first(where: { $0.languageIdentifier == identifier }) else {
+        guard setOutputSelection(identifier: identifier) else {
             return
+        }
+        await refreshResourceStatus()
+    }
+
+    @discardableResult
+    func setInputSelection(identifier: String) -> Bool {
+        guard let option = inputLanguages.first(where: { $0.localeIdentifier == identifier }) else {
+            return false
+        }
+        selectedInput = option
+        selectionDidChange()
+        persistCurrentConfiguration()
+        return true
+    }
+
+    @discardableResult
+    func setOutputSelection(identifier: String) -> Bool {
+        guard let option = outputLanguages.first(where: { $0.languageIdentifier == identifier }) else {
+            return false
         }
         selectedOutput = option
         selectionDidChange()
         persistCurrentConfiguration()
-        await refreshResourceStatus()
+        return true
     }
 
     func refreshResourceStatus() async {

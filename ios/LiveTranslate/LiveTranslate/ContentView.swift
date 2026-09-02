@@ -165,7 +165,7 @@ struct ContentView: View {
             .task {
                 viewModel.refreshCaption()
                 captionObservationLifecycle.pageDidAppear()
-                await viewModel.loadLanguages()
+                await viewModel.loadLanguagesIfNeeded()
             }
             .onAppear {
                 captionPiPController.didStop = {
@@ -222,7 +222,8 @@ struct ContentView: View {
             get: { viewModel.selectedInput?.localeIdentifier },
             set: { identifier in
                 guard let identifier else { return }
-                Task { await viewModel.selectInput(identifier: identifier) }
+                guard viewModel.setInputSelection(identifier: identifier) else { return }
+                Task { await viewModel.refreshResourceStatus() }
             }
         )
     }
@@ -232,7 +233,8 @@ struct ContentView: View {
             get: { viewModel.selectedOutput?.languageIdentifier },
             set: { identifier in
                 guard let identifier else { return }
-                Task { await viewModel.selectOutput(identifier: identifier) }
+                guard viewModel.setOutputSelection(identifier: identifier) else { return }
+                Task { await viewModel.refreshResourceStatus() }
             }
         )
     }

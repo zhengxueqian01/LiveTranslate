@@ -16,16 +16,54 @@ enum LanguagePickerFilter {
     }
 }
 
+struct LanguagePickerSelectionState: Equatable, Sendable {
+    private(set) var draftSelection: String?
+    private(set) var confirmedSelection: String?
+
+    init(initialSelection: String?) {
+        draftSelection = initialSelection
+        confirmedSelection = initialSelection
+    }
+
+    mutating func select(_ identifier: String) {
+        draftSelection = identifier
+        confirmedSelection = identifier
+    }
+
+    mutating func confirm() -> String? {
+        confirmedSelection = draftSelection
+        return confirmedSelection
+    }
+}
+
 struct LanguagePickerView: View {
+    @Environment(\.dismiss) private var dismiss
     let title: String
     let items: [LanguagePickerItem]
-    @Binding var selection: String?
+    @Binding private var selection: String?
+    @State private var selectionState: LanguagePickerSelectionState
     @State private var query = ""
+
+    init(
+        title: String,
+        items: [LanguagePickerItem],
+        selection: Binding<String?>
+    ) {
+        self.title = title
+        self.items = items
+        _selection = selection
+        _selectionState = State(
+            initialValue: LanguagePickerSelectionState(
+                initialSelection: selection.wrappedValue
+            )
+        )
+    }
 
     var body: some View {
         List(LanguagePickerFilter.filter(items, query: query)) { item in
             Button {
-                selection = item.id
+                selectionState.select(item.id)
+                selection = selectionState.confirmedSelection
             } label: {
                 HStack {
                     VStack(alignment: .leading, spacing: 2) {
@@ -37,7 +75,7 @@ struct LanguagePickerView: View {
                         }
                     }
                     Spacer()
-                    if selection == item.id {
+                    if selectionState.draftSelection == item.id {
                         Image(systemName: "checkmark")
                             .foregroundStyle(.tint)
                     }
@@ -47,6 +85,18 @@ struct LanguagePickerView: View {
         }
         .navigationTitle(title)
         .searchable(text: $query, prompt: "搜索语言")
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("完成") {
+                    guard let confirmedSelection = selectionState.confirm() else {
+                        return
+                    }
+                    selection = confirmedSelection
+                    dismiss()
+                }
+                .disabled(selectionState.draftSelection == nil)
+            }
+        }
     }
 
     private var titleCounts: [String: Int] {

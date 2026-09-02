@@ -681,6 +681,27 @@ final class AppViewModelTests: XCTestCase {
         XCTAssertNil(viewModel.errorMessage)
     }
 
+    func testLoadLanguagesIfNeededPreservesPartialReselection() async {
+        let defaults = isolatedDefaults()
+        defaults.set(Data([0x00, 0x01]), forKey: LanguageConfigurationStore.configurationKey)
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: RecordingLanguageResourceService(),
+            store: InMemoryCaptionStore(),
+            languageStore: LanguageConfigurationStore(defaults: defaults),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        await viewModel.loadLanguages()
+
+        XCTAssertTrue(
+            viewModel.setInputSelection(identifier: LanguageTestFixture.input.localeIdentifier)
+        )
+        await viewModel.loadLanguagesIfNeeded()
+
+        XCTAssertEqual(viewModel.selectedInput, LanguageTestFixture.input)
+        XCTAssertNil(viewModel.selectedOutput)
+    }
+
     func testUnsupportedSavedConfigurationVersionDisablesBroadcast() async throws {
         let defaults = isolatedDefaults()
         let unsupported = LanguagePairConfiguration(

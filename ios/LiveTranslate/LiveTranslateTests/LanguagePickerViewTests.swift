@@ -2,6 +2,17 @@ import XCTest
 @testable import LiveTranslate
 
 final class LanguagePickerViewTests: XCTestCase {
+    func testSelectingLanguageCommitsItImmediately() {
+        var state = LanguagePickerSelectionState(initialSelection: "en-US")
+
+        state.select("ja-JP")
+
+        XCTAssertEqual(state.draftSelection, "ja-JP")
+        XCTAssertEqual(state.confirmedSelection, "ja-JP")
+        XCTAssertEqual(state.confirm(), "ja-JP")
+        XCTAssertEqual(state.confirmedSelection, "ja-JP")
+    }
+
     func testFilterMatchesLocalizedNameAndStableIdentifier() {
         let items = [
             LanguagePickerItem(id: "ja-JP", title: "日语（日本）"),
