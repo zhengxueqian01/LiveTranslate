@@ -21,6 +21,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
     private let translator: (any CaptionTranslating)?
     private let store: any CaptionStoreProtocol
     private let onFailure: @Sendable (any Error) async -> Void
+    private let sessionIdentifier = UUID()
     private let lock = NSLock()
     private var lifecycle = Lifecycle.initialized
     private var hasSilenceWarning = false
@@ -338,6 +339,7 @@ final class BroadcastCaptionCoordinator: @unchecked Sendable {
         let previous = try store.load()
         try store.save(
             CaptionSnapshot(
+                sessionIdentifier: sessionIdentifier,
                 revision: revision ?? (previous?.revision ?? 0) + 1,
                 sourceText: sourceText ?? previous?.sourceText ?? "",
                 translatedText: translatedText ?? previous?.translatedText ?? "",

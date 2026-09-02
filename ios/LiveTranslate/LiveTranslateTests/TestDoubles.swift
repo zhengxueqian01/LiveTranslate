@@ -36,18 +36,22 @@ struct FailingLanguageCatalogService: LanguageCatalogProviding {
 
 final class InMemoryLanguageConfigurationStore: LanguageConfigurationStoring, @unchecked Sendable {
     private let lock = NSLock()
-    private var value: LanguagePairConfiguration?
+    private var result: LanguageConfigurationLoadResult
 
     init(value: LanguagePairConfiguration? = nil) {
-        self.value = value
+        result = value.map(LanguageConfigurationLoadResult.configuration) ?? .missing
     }
 
-    func load() -> LanguagePairConfiguration? {
-        lock.withLock { value }
+    init(result: LanguageConfigurationLoadResult) {
+        self.result = result
+    }
+
+    func loadResult() -> LanguageConfigurationLoadResult {
+        lock.withLock { result }
     }
 
     func save(_ configuration: LanguagePairConfiguration) {
-        lock.withLock { value = configuration }
+        lock.withLock { result = .configuration(configuration) }
     }
 }
 

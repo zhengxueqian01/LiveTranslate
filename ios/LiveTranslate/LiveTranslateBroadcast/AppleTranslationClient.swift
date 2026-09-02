@@ -18,6 +18,14 @@ enum AppleTranslationClientError: LocalizedError, Sendable {
     }
 }
 
+struct AppleTranslationClientBuilder: BroadcastTranslationClientBuilding {
+    func makeTranslationClient(
+        configuration: TranslationClientConfiguration
+    ) -> any CaptionTranslating {
+        AppleTranslationClient(configuration: configuration)
+    }
+}
+
 actor AppleTranslationClient: CaptionTranslating {
     private let configuration: TranslationClientConfiguration
     private let source: Locale.Language

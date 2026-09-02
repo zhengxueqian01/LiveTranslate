@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import LiveTranslate
 
@@ -69,6 +70,39 @@ final class AppViewModelTests: XCTestCase {
         try await Task.sleep(for: .milliseconds(300))
 
         XCTAssertNil(viewModel.latestSnapshot)
+    }
+
+    func testPictureInPictureStopDoesNotTerminatePageCaptionObservation() async throws {
+        let store = InMemoryCaptionStore()
+        let viewModel = makeViewModel(store: store)
+        let lifecycle = CaptionPreviewObservationLifecycle(viewModel: viewModel)
+        let snapshot = CaptionSnapshot(
+            revision: 10,
+            sourceText: "Still updating",
+            translatedText: "仍在更新",
+            phase: .recognizing,
+            errorMessage: nil,
+            updatedAt: .now
+        )
+        let updateObserved = expectation(description: "Page preview receives the next snapshot")
+        let observation = viewModel.$latestSnapshot
+            .dropFirst()
+            .sink { value in
+                if value == snapshot {
+                    updateObserved.fulfill()
+                }
+            }
+
+        lifecycle.pageDidAppear()
+        defer {
+            lifecycle.pageDidDisappear()
+            observation.cancel()
+        }
+        lifecycle.pictureInPictureDidStop()
+        try store.save(snapshot)
+
+        await fulfillment(of: [updateObserved], timeout: 1)
+        XCTAssertEqual(viewModel.latestSnapshot, snapshot)
     }
 
     func testLoadingLanguagesDoesNotPrepareResources() async {
@@ -437,6 +471,274 @@ final class AppViewModelTests: XCTestCase {
         )
     }
 
+    func testTranslationPreparationErrorDoesNotBlockInstalledPairAfterRefresh() async {
+        let resources = RecordingLanguageResourceService()
+        await resources.setState(
+            .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .needsDownload
+            ),
+            for: LanguageTestFixture.pair
+        )
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: resources,
+            store: InMemoryCaptionStore(),
+            languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        await viewModel.loadLanguages()
+        let action = await viewModel.beginModelPreparation()
+        guard case .prepareTranslation(let request) = action else {
+            XCTFail("Expected a translation preparation request")
+            return
+        }
+        await resources.setState(
+            .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .installed
+            ),
+            for: LanguageTestFixture.pair
+        )
+
+        await viewModel.finishTranslationPreparation(
+            for: request,
+            error: ModelPreparationTestError.installationFailed
+        )
+
+        XCTAssertTrue(viewModel.resourceState.isReady)
+        XCTAssertTrue(viewModel.canStartBroadcast)
+        XCTAssertNil(viewModel.errorMessage)
+    }
+
+    func testCaptionReadFailureIsInformationalAndClearsAfterSuccessfulRead() async throws {
+        let snapshot = CaptionSnapshot(
+            revision: 4,
+            sourceText: "Recovered",
+            translatedText: "已恢复",
+            phase: .stopped,
+            errorMessage: nil,
+            updatedAt: .now
+        )
+        let store = RecoveringCaptionStore(snapshot: snapshot)
+        let resources = RecordingLanguageResourceService()
+        await resources.setState(
+            .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .installed
+            ),
+            for: LanguageTestFixture.pair
+        )
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: resources,
+            store: store,
+            languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        await viewModel.loadLanguages()
+
+        viewModel.refreshCaption()
+
+        XCTAssertTrue(viewModel.canStartBroadcast)
+        XCTAssertNotNil(viewModel.errorMessage)
+
+        viewModel.refreshCaption()
+
+        XCTAssertTrue(viewModel.canStartBroadcast)
+        XCTAssertNil(viewModel.errorMessage)
+        XCTAssertEqual(viewModel.latestSnapshot, snapshot)
+    }
+
+    func testSuccessfulCaptionReadDoesNotClearCatalogBlockingError() async {
+        let snapshot = CaptionSnapshot(
+            revision: 1,
+            sourceText: "cached",
+            translatedText: "缓存",
+            phase: .stopped,
+            errorMessage: nil,
+            updatedAt: .now
+        )
+        let viewModel = AppViewModel(
+            catalogService: FailingLanguageCatalogService(
+                error: ModelPreparationTestError.catalogFailed
+            ),
+            resourceService: RecordingLanguageResourceService(),
+            store: RecoveringCaptionStore(snapshot: snapshot),
+            languageStore: InMemoryLanguageConfigurationStore(),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        await viewModel.loadLanguages()
+
+        viewModel.refreshCaption()
+        viewModel.refreshCaption()
+
+        XCTAssertFalse(viewModel.canStartBroadcast)
+        XCTAssertEqual(
+            viewModel.errorMessage,
+            "语言列表加载失败：模拟目录加载失败"
+        )
+    }
+
+    func testCorruptSavedConfigurationRequiresExplicitReselection() async {
+        let defaults = isolatedDefaults()
+        defaults.set(Data([0x00, 0x01]), forKey: LanguageConfigurationStore.configurationKey)
+        let resources = RecordingLanguageResourceService()
+        await resources.setState(
+            .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .installed
+            ),
+            for: LanguageTestFixture.pair
+        )
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: resources,
+            store: InMemoryCaptionStore(),
+            languageStore: LanguageConfigurationStore(defaults: defaults),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+
+        await viewModel.loadLanguages()
+
+        XCTAssertNil(viewModel.currentConfiguration)
+        XCTAssertFalse(viewModel.canStartBroadcast)
+        XCTAssertTrue(viewModel.errorMessage?.contains("重新选择") == true)
+
+        await viewModel.selectInput(identifier: LanguageTestFixture.input.localeIdentifier)
+        XCTAssertFalse(viewModel.canStartBroadcast)
+        await viewModel.selectOutput(identifier: LanguageTestFixture.output.languageIdentifier)
+
+        XCTAssertEqual(viewModel.currentConfiguration, LanguageTestFixture.pair)
+        XCTAssertTrue(viewModel.canStartBroadcast)
+        XCTAssertNil(viewModel.errorMessage)
+    }
+
+    func testUnsupportedSavedConfigurationVersionDisablesBroadcast() async throws {
+        let defaults = isolatedDefaults()
+        let unsupported = LanguagePairConfiguration(
+            schemaVersion: 999,
+            sourceSpeechLocaleIdentifier: "fr-FR",
+            sourceTranslationLanguageIdentifier: "fr",
+            targetTranslationLanguageIdentifier: "de"
+        )
+        defaults.set(
+            try PropertyListEncoder().encode(unsupported),
+            forKey: LanguageConfigurationStore.configurationKey
+        )
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: RecordingLanguageResourceService(),
+            store: InMemoryCaptionStore(),
+            languageStore: LanguageConfigurationStore(defaults: defaults),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+
+        await viewModel.loadLanguages()
+
+        XCTAssertNil(viewModel.currentConfiguration)
+        XCTAssertFalse(viewModel.canStartBroadcast)
+        XCTAssertTrue(viewModel.errorMessage?.contains("重新选择") == true)
+    }
+
+    func testNoLongerCataloguedSavedConfigurationDisablesBroadcast() async {
+        let unavailable = LanguagePairConfiguration(
+            sourceSpeechLocaleIdentifier: "en-US",
+            sourceTranslationLanguageIdentifier: "en",
+            targetTranslationLanguageIdentifier: "zh-Hans"
+        )
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: RecordingLanguageResourceService(),
+            store: InMemoryCaptionStore(),
+            languageStore: InMemoryLanguageConfigurationStore(value: unavailable),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+
+        await viewModel.loadLanguages()
+
+        XCTAssertNil(viewModel.currentConfiguration)
+        XCTAssertFalse(viewModel.canStartBroadcast)
+        XCTAssertTrue(viewModel.errorMessage?.contains("重新选择") == true)
+    }
+
+    func testMissingConfigurationDefaultsAndPersistsFirstRunSelection() async {
+        let resources = RecordingLanguageResourceService()
+        await resources.setState(
+            .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .installed
+            ),
+            for: LanguageTestFixture.pair
+        )
+        let languageStore = InMemoryLanguageConfigurationStore()
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: resources,
+            store: InMemoryCaptionStore(),
+            languageStore: languageStore,
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+
+        await viewModel.loadLanguages()
+
+        XCTAssertEqual(viewModel.currentConfiguration, LanguageTestFixture.pair)
+        XCTAssertEqual(languageStore.load(), LanguageTestFixture.pair)
+        XCTAssertTrue(viewModel.canStartBroadcast)
+    }
+
+    func testTargetFallbackPrefersCurrentSystemLanguageWhenChineseIsUnavailable() async {
+        let french = TranslationLanguageOption(
+            languageIdentifier: "fr",
+            displayName: "français"
+        )
+        let catalog = LanguageCatalogSnapshot(
+            inputLanguages: [LanguageTestFixture.input],
+            outputLanguages: [LanguageTestFixture.output, french]
+        )
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: catalog),
+            resourceService: RecordingLanguageResourceService(),
+            store: InMemoryCaptionStore(),
+            languageStore: InMemoryLanguageConfigurationStore(),
+            displayLocale: Locale(identifier: "fr-FR")
+        )
+
+        await viewModel.loadLanguages()
+
+        XCTAssertEqual(viewModel.selectedOutput, french)
+    }
+
+    func testNewBroadcastSessionReplacesCachedHigherRevisionAfterCorruptStoreRecovery() async throws {
+        let defaults = isolatedDefaults()
+        let store = CaptionStore(defaults: defaults)
+        let oldSnapshot = CaptionSnapshot(
+            revision: 10_000,
+            sourceText: "old",
+            translatedText: "旧字幕",
+            phase: .stopped,
+            errorMessage: nil,
+            updatedAt: Date(timeIntervalSince1970: 1)
+        )
+        try store.save(oldSnapshot)
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: RecordingLanguageResourceService(),
+            store: store,
+            languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        viewModel.refreshCaption()
+        defaults.set(Data([0xFF, 0xAA]), forKey: "caption.snapshot")
+
+        try BroadcastCaptionCoordinator(store: store).begin()
+        viewModel.refreshCaption()
+
+        XCTAssertEqual(viewModel.latestSnapshot?.phase, .broadcasting)
+        XCTAssertEqual(viewModel.latestSnapshot?.sourceText, "")
+        XCTAssertNotEqual(viewModel.latestSnapshot, oldSnapshot)
+    }
+
     func testEmptyCatalogReportsErrorAndDisablesBroadcast() async {
         let viewModel = AppViewModel(
             catalogService: FixedLanguageCatalogService(
@@ -465,5 +767,45 @@ final class AppViewModelTests: XCTestCase {
             languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
             displayLocale: Locale(identifier: "zh-Hans")
         )
+    }
+
+    private func isolatedDefaults() -> UserDefaults {
+        let suiteName = "AppViewModelTests.\(UUID().uuidString)"
+        addTeardownBlock {
+            UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        }
+        return UserDefaults(suiteName: suiteName)!
+    }
+}
+
+private final class RecoveringCaptionStore: CaptionStoreProtocol, @unchecked Sendable {
+    private let lock = NSLock()
+    private let snapshot: CaptionSnapshot
+    private var shouldFail = true
+
+    init(snapshot: CaptionSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func load() throws -> CaptionSnapshot? {
+        try lock.withLock {
+            if shouldFail {
+                shouldFail = false
+                throw RecoveringCaptionStoreError.firstReadFailed
+            }
+            return snapshot
+        }
+    }
+
+    func save(_ snapshot: CaptionSnapshot) throws {}
+
+    func clear() throws {}
+}
+
+private enum RecoveringCaptionStoreError: LocalizedError {
+    case firstReadFailed
+
+    var errorDescription: String? {
+        "模拟首次读取失败"
     }
 }

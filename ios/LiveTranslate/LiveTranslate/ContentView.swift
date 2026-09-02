@@ -10,12 +10,17 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel: AppViewModel
+    private let captionObservationLifecycle: CaptionPreviewObservationLifecycle
     @State private var translationConfiguration: TranslationSession.Configuration?
     @State private var translationPreparation: TranslationPreparationRequest?
     @StateObject private var captionPiPController = CaptionPiPController()
 
     init(viewModel: AppViewModel? = nil) {
-        _viewModel = StateObject(wrappedValue: viewModel ?? AppViewModel.live())
+        let resolvedViewModel = viewModel ?? AppViewModel.live()
+        _viewModel = StateObject(wrappedValue: resolvedViewModel)
+        captionObservationLifecycle = CaptionPreviewObservationLifecycle(
+            viewModel: resolvedViewModel
+        )
     }
 
     var body: some View {
@@ -112,11 +117,10 @@ struct ContentView: View {
                         .frame(height: 112)
                         .clipShape(RoundedRectangle(cornerRadius: 12))
                     Text(viewModel.latestSnapshot?.sourceText ?? "等待原文字幕")
-                    Text(viewModel.latestSnapshot?.translatedText ?? "等待中文翻译")
+                    Text(viewModel.latestSnapshot?.translatedText ?? "等待译文字幕")
                         .foregroundStyle(.secondary)
                     if captionPiPController.isReadyForPictureInPicture {
                         Button("打开画中画字幕") {
-                            viewModel.startCaptionObservation()
                             captionPiPController.start()
                             if let snapshot = viewModel.latestSnapshot {
                                 captionPiPController.render(snapshot)
@@ -160,12 +164,12 @@ struct ContentView: View {
             .navigationTitle("实时字幕翻译")
             .task {
                 viewModel.refreshCaption()
-                viewModel.startCaptionObservation()
+                captionObservationLifecycle.pageDidAppear()
                 await viewModel.loadLanguages()
             }
             .onAppear {
                 captionPiPController.didStop = {
-                    viewModel.stopCaptionObservation()
+                    captionObservationLifecycle.pictureInPictureDidStop()
                 }
             }
             .onChange(of: viewModel.latestSnapshot) { _, snapshot in
@@ -175,7 +179,7 @@ struct ContentView: View {
                 captionPiPController.render(snapshot)
             }
             .onDisappear {
-                viewModel.stopCaptionObservation()
+                captionObservationLifecycle.pageDidDisappear()
                 captionPiPController.stop()
             }
             .translationTask(translationConfiguration) { session in

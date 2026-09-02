@@ -40,6 +40,7 @@ final class AppViewModel: ObservableObject {
     private let languageStore: any LanguageConfigurationStoring
     private let displayLocale: Locale
     private let storageErrorMessage: String?
+    private var configurationErrorMessage: String?
     private var modelErrorMessage: String?
     private var releaseErrorMessage: String?
     private var captionErrorMessage: String?
@@ -60,7 +61,10 @@ final class AppViewModel: ObservableObject {
     }
 
     var canStartBroadcast: Bool {
-        store != nil && resourceState.isReady && errorMessage == nil
+        store != nil
+            && currentConfiguration != nil
+            && resourceState.isReady
+            && blockingErrorMessage == nil
     }
 
     var canReleaseSpeechModels: Bool {
@@ -85,6 +89,7 @@ final class AppViewModel: ObservableObject {
         storageErrorMessage = store == nil
             ? "无法打开 App Group，请检查两个 Target 的签名与 App Group 配置。"
             : nil
+        configurationErrorMessage = nil
         modelErrorMessage = nil
         releaseErrorMessage = nil
         captionErrorMessage = nil
@@ -121,6 +126,7 @@ final class AppViewModel: ObservableObject {
         preparationPhase = .idle
         activeTranslationPreparation = nil
         languageCatalogErrorMessage = nil
+        configurationErrorMessage = nil
         modelErrorMessage = nil
         refreshErrorMessage()
 
@@ -133,13 +139,26 @@ final class AppViewModel: ObservableObject {
 
             inputLanguages = snapshot.inputLanguages
             outputLanguages = snapshot.outputLanguages
-            let resolved = resolveSelection(
-                saved: languageStore.load(),
-                snapshot: snapshot
-            )
-            selectedInput = resolved.input
-            selectedOutput = resolved.output
-            persistCurrentConfiguration()
+            switch languageStore.loadResult() {
+            case .missing:
+                let resolved = defaultSelection(in: snapshot)
+                selectedInput = resolved.input
+                selectedOutput = resolved.output
+                persistCurrentConfiguration()
+            case .configuration(let saved):
+                guard let resolved = resolveSavedSelection(
+                    saved: saved,
+                    snapshot: snapshot
+                ) else {
+                    invalidateSavedSelection()
+                    return
+                }
+                selectedInput = resolved.input
+                selectedOutput = resolved.output
+            case .invalid:
+                invalidateSavedSelection()
+                return
+            }
             await refreshResourceStatus()
         } catch {
             guard generation == requestGeneration else { return }
@@ -186,6 +205,10 @@ final class AppViewModel: ObservableObject {
             return
         }
         resourceState = state
+        if state.isReady {
+            modelErrorMessage = nil
+        }
+        refreshErrorMessage()
     }
 
     func loadReservedSpeechLocales() async {
@@ -270,7 +293,13 @@ final class AppViewModel: ObservableObject {
             }
             activeTranslationPreparation = nil
             preparationPhase = .idle
-            modelErrorMessage = "模型准备失败：\(error.localizedDescription)"
+            await refreshResourceStatus()
+            guard generation == selectionGeneration, request == currentConfiguration else {
+                return .none
+            }
+            modelErrorMessage = resourceState.isReady
+                ? nil
+                : "模型准备失败：\(error.localizedDescription)"
             refreshErrorMessage()
             return .none
         }
@@ -286,8 +315,10 @@ final class AppViewModel: ObservableObject {
         }
         activeTranslationPreparation = nil
         preparationPhase = .idle
-        modelErrorMessage = error.map { "翻译模型准备失败：\($0.localizedDescription)" }
         await refreshResourceStatus()
+        modelErrorMessage = resourceState.isReady
+            ? nil
+            : error.map { "翻译模型准备失败：\($0.localizedDescription)" }
         refreshErrorMessage()
     }
 
@@ -296,10 +327,16 @@ final class AppViewModel: ObservableObject {
             return
         }
         do {
-            guard let incomingSnapshot = try store.load() else {
+            let incomingSnapshot = try store.load()
+            captionErrorMessage = nil
+            refreshErrorMessage()
+            guard let incomingSnapshot else {
                 return
             }
-            guard latestSnapshot.map({ incomingSnapshot.revision > $0.revision }) ?? true else {
+            guard Self.shouldAccept(
+                incomingSnapshot,
+                replacing: latestSnapshot
+            ) else {
                 return
             }
             latestSnapshot = incomingSnapshot
@@ -354,6 +391,9 @@ final class AppViewModel: ObservableObject {
         activeTranslationPreparation = nil
         resourceState = Self.unknownResourceState
         modelErrorMessage = nil
+        if currentConfiguration != nil {
+            configurationErrorMessage = nil
+        }
         refreshErrorMessage()
     }
 
@@ -362,33 +402,38 @@ final class AppViewModel: ObservableObject {
         languageStore.save(currentConfiguration)
     }
 
-    private func resolveSelection(
-        saved: LanguagePairConfiguration?,
+    private func resolveSavedSelection(
+        saved: LanguagePairConfiguration,
         snapshot: LanguageCatalogSnapshot
-    ) -> (input: SpeechLanguageOption, output: TranslationLanguageOption) {
-        if let saved,
-           let input = snapshot.inputLanguages.first(where: {
-               $0.localeIdentifier == saved.sourceSpeechLocaleIdentifier
-                   && $0.translationLanguageIdentifier == saved.sourceTranslationLanguageIdentifier
-           }),
-           let output = snapshot.outputLanguages.first(where: {
-               $0.languageIdentifier == saved.targetTranslationLanguageIdentifier
-           }) {
-            return (input, output)
+    ) -> (input: SpeechLanguageOption, output: TranslationLanguageOption)? {
+        guard let input = snapshot.inputLanguages.first(where: {
+            $0.localeIdentifier == saved.sourceSpeechLocaleIdentifier
+                && $0.translationLanguageIdentifier == saved.sourceTranslationLanguageIdentifier
+        }),
+        let output = snapshot.outputLanguages.first(where: {
+            $0.languageIdentifier == saved.targetTranslationLanguageIdentifier
+        }) else {
+            return nil
         }
+        return (input, output)
+    }
 
+    private func defaultSelection(
+        in snapshot: LanguageCatalogSnapshot
+    ) -> (input: SpeechLanguageOption, output: TranslationLanguageOption) {
         let input = preferredSystemInput(from: snapshot.inputLanguages)
             ?? snapshot.inputLanguages[0]
         let output = snapshot.outputLanguages.first(where: {
             $0.languageIdentifier == "zh-Hans"
-        }) ?? snapshot.outputLanguages[0]
+        }) ?? preferredSystemOutput(from: snapshot.outputLanguages)
+            ?? snapshot.outputLanguages[0]
         return (input, output)
     }
 
     private func preferredSystemInput(
         from options: [SpeechLanguageOption]
     ) -> SpeechLanguageOption? {
-        let current = Locale.current
+        let current = displayLocale
         let canonicalIdentifier = Locale.canonicalIdentifier(from: current.identifier)
         if let exact = options.first(where: {
             Locale.canonicalIdentifier(from: $0.localeIdentifier) == canonicalIdentifier
@@ -404,12 +449,41 @@ final class AppViewModel: ObservableObject {
         })
     }
 
+    private func preferredSystemOutput(
+        from options: [TranslationLanguageOption]
+    ) -> TranslationLanguageOption? {
+        let language = displayLocale.language
+        let candidates = [
+            language.minimalIdentifier,
+            language.languageCode?.identifier
+        ].compactMap { $0 }
+        return candidates.lazy.compactMap { candidate in
+            options.first(where: { $0.languageIdentifier == candidate })
+        }.first
+    }
+
+    private func invalidateSavedSelection() {
+        selectedInput = nil
+        selectedOutput = nil
+        resourceState = Self.unknownResourceState
+        preparationPhase = .idle
+        activeTranslationPreparation = nil
+        configurationErrorMessage =
+            "已保存的语言配置不可用，请重新选择输入语言和目标语言。"
+        refreshErrorMessage()
+    }
+
     private func refreshErrorMessage() {
-        errorMessage = storageErrorMessage
+        errorMessage = blockingErrorMessage
+            ?? releaseErrorMessage
             ?? captionErrorMessage
+    }
+
+    private var blockingErrorMessage: String? {
+        storageErrorMessage
+            ?? configurationErrorMessage
             ?? languageCatalogErrorMessage
             ?? modelErrorMessage
-            ?? releaseErrorMessage
     }
 
     private var isBroadcastActive: Bool {
@@ -424,11 +498,24 @@ final class AppViewModel: ObservableObject {
             false
         }
     }
+
+    private static func shouldAccept(
+        _ incoming: CaptionSnapshot,
+        replacing current: CaptionSnapshot?
+    ) -> Bool {
+        guard let current else { return true }
+        if let incomingSession = incoming.sessionIdentifier {
+            return incomingSession != current.sessionIdentifier
+                || incoming.revision > current.revision
+        }
+        return current.sessionIdentifier == nil
+            && incoming.revision > current.revision
+    }
 }
 
 private struct UnavailableLanguageConfigurationStore: LanguageConfigurationStoring {
-    func load() -> LanguagePairConfiguration? {
-        nil
+    func loadResult() -> LanguageConfigurationLoadResult {
+        .missing
     }
 
     func save(_ configuration: LanguagePairConfiguration) {}

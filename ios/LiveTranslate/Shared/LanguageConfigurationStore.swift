@@ -1,8 +1,23 @@
 import Foundation
 
+enum LanguageConfigurationLoadResult: Equatable, Sendable {
+    case missing
+    case invalid
+    case configuration(LanguagePairConfiguration)
+}
+
 protocol LanguageConfigurationStoring: Sendable {
-    func load() -> LanguagePairConfiguration?
+    func loadResult() -> LanguageConfigurationLoadResult
     func save(_ configuration: LanguagePairConfiguration)
+}
+
+extension LanguageConfigurationStoring {
+    func load() -> LanguagePairConfiguration? {
+        guard case .configuration(let configuration) = loadResult() else {
+            return nil
+        }
+        return configuration
+    }
 }
 
 final class LanguageConfigurationStore: LanguageConfigurationStoring, @unchecked Sendable {
@@ -22,14 +37,25 @@ final class LanguageConfigurationStore: LanguageConfigurationStoring, @unchecked
         self.defaults = defaults
     }
 
-    func load() -> LanguagePairConfiguration? {
-        if let data = defaults.data(forKey: Self.configurationKey),
-           let value = try? PropertyListDecoder().decode(LanguagePairConfiguration.self, from: data),
-           value.schemaVersion == LanguagePairConfiguration.currentSchemaVersion {
-            return value
+    func loadResult() -> LanguageConfigurationLoadResult {
+        if defaults.object(forKey: Self.configurationKey) != nil {
+            guard let data = defaults.data(forKey: Self.configurationKey),
+                  let value = try? PropertyListDecoder().decode(
+                      LanguagePairConfiguration.self,
+                      from: data
+                  ),
+                  value.schemaVersion == LanguagePairConfiguration.currentSchemaVersion else {
+                return .invalid
+            }
+            return .configuration(value)
         }
 
-        guard let legacy = defaults.string(forKey: Self.legacySourceKey) else { return nil }
+        guard defaults.object(forKey: Self.legacySourceKey) != nil else {
+            return .missing
+        }
+        guard let legacy = defaults.string(forKey: Self.legacySourceKey) else {
+            return .invalid
+        }
 
         let migrated: LanguagePairConfiguration?
         switch legacy {
@@ -49,8 +75,9 @@ final class LanguageConfigurationStore: LanguageConfigurationStoring, @unchecked
             migrated = nil
         }
 
-        if let migrated { save(migrated) }
-        return migrated
+        guard let migrated else { return .invalid }
+        save(migrated)
+        return .configuration(migrated)
     }
 
     func save(_ configuration: LanguagePairConfiguration) {

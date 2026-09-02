@@ -31,7 +31,12 @@ final class CaptionStore: CaptionStoreProtocol, @unchecked Sendable {
         guard let data = defaults.data(forKey: Self.snapshotKey) else {
             return nil
         }
-        return try PropertyListDecoder().decode(CaptionSnapshot.self, from: data)
+        do {
+            return try PropertyListDecoder().decode(CaptionSnapshot.self, from: data)
+        } catch {
+            defaults.removeObject(forKey: Self.snapshotKey)
+            return nil
+        }
     }
 
     func save(_ snapshot: CaptionSnapshot) throws {

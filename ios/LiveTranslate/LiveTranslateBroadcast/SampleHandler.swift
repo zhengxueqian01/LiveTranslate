@@ -40,6 +40,7 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     private var silenceState = SilenceMonitorState()
     private var captionCoordinator: BroadcastCaptionCoordinator?
     private var audioQueue: BoundedAsyncQueue<CapturedAudioSample>?
+    private var startupTask: Task<Void, Never>?
     private var audioTask: Task<Void, Never>?
     private var silenceMonitorTask: Task<Void, Never>?
     private var lastRecognizedText = ""
@@ -47,59 +48,92 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     private var didComplete = false
 
     override func broadcastStarted(withSetupInfo setupInfo: [String : NSObject]?) {
+        let task = Task { [weak self] in
+            guard let self else { return }
+            await startBroadcast()
+        }
+        let shouldCancel = stateLock.withLock {
+            guard !didComplete, !isEnding else { return true }
+            startupTask = task
+            return false
+        }
+        if shouldCancel {
+            task.cancel()
+        }
+    }
+
+    private func startBroadcast() async {
+        var startedCoordinator: BroadcastCaptionCoordinator?
         do {
             let captionStore = try CaptionStore()
+            let failureCoordinator = BroadcastCaptionCoordinator(store: captionStore)
+            try stateLock.withLock {
+                guard !didComplete, !isEnding, !Task.isCancelled else {
+                    throw CancellationError()
+                }
+                captionCoordinator = failureCoordinator
+            }
+
             let configurationStore = try LanguageConfigurationStore()
             guard let configuration = configurationStore.load() else {
-                let coordinator = BroadcastCaptionCoordinator(store: captionStore)
-                stateLock.withLock {
-                    captionCoordinator = coordinator
-                }
                 throw BroadcastCaptureError.languageConfigurationMissing
             }
-            let translator: any CaptionTranslating = configuration.usesPassThroughTranslation
-                ? PassThroughTranslationClient()
-                : AppleTranslationClient(
-                    configuration: TranslationClientConfiguration(configuration)
-                )
+            let resources = try await BroadcastStartupPreparer(
+                checker: SystemBroadcastInstalledResourceChecker(),
+                translationClientBuilder: AppleTranslationClientBuilder()
+            ).prepare(configuration: configuration)
+            try Task.checkCancellation()
+
             let coordinator = BroadcastCaptionCoordinator(
-                translator: translator,
+                translator: resources.translator,
                 store: captionStore,
                 onFailure: { [weak self] error in
                     self?.failBroadcast(error)
                 }
             )
-            stateLock.withLock {
+            try stateLock.withLock {
+                guard !didComplete, !isEnding, !Task.isCancelled else {
+                    throw CancellationError()
+                }
+                try coordinator.begin()
                 captionCoordinator = coordinator
                 clockOrigin = clock.now
                 silenceState.start(at: .zero)
                 lastRecognizedText = ""
             }
-
-            try coordinator.begin()
+            startedCoordinator = coordinator
+            try Task.checkCancellation()
 
             let queue = BoundedAsyncQueue<CapturedAudioSample>(
                 capacity: Self.audioQueueCapacity
             )
             let sessionTask = Task { [weak self] in
                 _ = await self?.runAudioSession(
-                    sourceLocaleIdentifier: configuration.sourceSpeechLocaleIdentifier,
+                    sourceLocaleIdentifier: resources.sourceSpeechLocaleIdentifier,
                     queue: queue,
                     coordinator: coordinator
                 )
             }
             let monitorTask = makeSilenceMonitor(coordinator: coordinator)
-            stateLock.withLock {
-                guard !didComplete else {
-                    queue.finish()
-                    sessionTask.cancel()
-                    monitorTask.cancel()
-                    return
+            let shouldCancel = stateLock.withLock {
+                guard !didComplete, !isEnding, !Task.isCancelled else {
+                    return true
                 }
                 audioQueue = queue
+                startupTask = nil
                 audioTask = sessionTask
                 silenceMonitorTask = monitorTask
+                return false
             }
+            if shouldCancel {
+                queue.finish()
+                sessionTask.cancel()
+                monitorTask.cancel()
+                throw CancellationError()
+            }
+        } catch is CancellationError {
+            try? startedCoordinator?.stop()
+            completeNormally()
         } catch {
             failBroadcast(error)
         }
@@ -127,15 +161,22 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     }
 
     override func broadcastFinished() {
-        let resources = stateLock.withLock { () -> (BoundedAsyncQueue<CapturedAudioSample>?, Task<Void, Never>?) in
-            guard !didComplete, !isEnding else { return (nil, nil) }
+        let resources = stateLock.withLock { () -> (
+            queue: BoundedAsyncQueue<CapturedAudioSample>?,
+            startupTask: Task<Void, Never>?,
+            monitorTask: Task<Void, Never>?
+        ) in
+            guard !didComplete, !isEnding else { return (nil, nil, nil) }
             isEnding = true
+            let startupTask = startupTask
             let monitorTask = silenceMonitorTask
+            self.startupTask = nil
             silenceMonitorTask = nil
-            return (audioQueue, monitorTask)
+            return (audioQueue, startupTask, monitorTask)
         }
-        resources.1?.cancel()
-        resources.0?.finish()
+        resources.startupTask?.cancel()
+        resources.monitorTask?.cancel()
+        resources.queue?.finish()
     }
 
     override func processSampleBuffer(
@@ -310,47 +351,57 @@ final class SampleHandler: RPBroadcastSampleHandler, @unchecked Sendable {
     }
 
     private func completeNormally() {
-        let monitorTask = stateLock.withLock { () -> Task<Void, Never>? in
-            guard !didComplete else { return nil }
+        let tasks = stateLock.withLock { () -> (
+            startupTask: Task<Void, Never>?,
+            monitorTask: Task<Void, Never>?
+        ) in
+            guard !didComplete else { return (nil, nil) }
             didComplete = true
             isEnding = true
+            let startupTask = startupTask
             let monitorTask = silenceMonitorTask
+            self.startupTask = nil
             silenceMonitorTask = nil
             audioQueue = nil
             audioTask = nil
-            return monitorTask
+            return (startupTask, monitorTask)
         }
-        monitorTask?.cancel()
+        tasks.startupTask?.cancel()
+        tasks.monitorTask?.cancel()
     }
 
     private func failBroadcast(_ error: any Error) {
         let resources = stateLock.withLock { () -> (
-            BoundedAsyncQueue<CapturedAudioSample>?,
-            Task<Void, Never>?,
-            Task<Void, Never>?,
-            BroadcastCaptionCoordinator?
+            queue: BoundedAsyncQueue<CapturedAudioSample>?,
+            startupTask: Task<Void, Never>?,
+            audioTask: Task<Void, Never>?,
+            monitorTask: Task<Void, Never>?,
+            coordinator: BroadcastCaptionCoordinator?
         )? in
             guard !didComplete else { return nil }
             didComplete = true
             isEnding = true
             let resources = (
                 audioQueue,
+                startupTask,
                 audioTask,
                 silenceMonitorTask,
                 captionCoordinator
             )
             audioQueue = nil
+            startupTask = nil
             audioTask = nil
             silenceMonitorTask = nil
             return resources
         }
         guard let resources else { return }
 
-        resources.0?.finish()
-        resources.1?.cancel()
-        resources.2?.cancel()
+        resources.queue?.finish()
+        resources.startupTask?.cancel()
+        resources.audioTask?.cancel()
+        resources.monitorTask?.cancel()
         do {
-            try resources.3?.fail(message: error.localizedDescription)
+            try resources.coordinator?.fail(message: error.localizedDescription)
         } catch {
             // The original failure remains the error reported to ReplayKit.
         }

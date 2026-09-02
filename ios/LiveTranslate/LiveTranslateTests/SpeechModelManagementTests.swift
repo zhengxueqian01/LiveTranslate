@@ -143,6 +143,29 @@ final class SpeechModelManagementTests: XCTestCase {
         XCTAssertTrue(viewModel.canStartBroadcast)
     }
 
+    func testFailureReleasingNonCurrentLocaleDoesNotBlockReadyPair() async {
+        let resourceService = BlockingLanguageResourceService(
+            state: .init(
+                speech: .init(status: .installed, isReserved: true),
+                translation: .installed
+            ),
+            releaseResults: [false]
+        )
+        let viewModel = AppViewModel(
+            catalogService: FixedLanguageCatalogService(snapshot: LanguageTestFixture.catalog),
+            resourceService: resourceService,
+            store: InMemoryCaptionStore(),
+            languageStore: InMemoryLanguageConfigurationStore(value: LanguageTestFixture.pair),
+            displayLocale: Locale(identifier: "zh-Hans")
+        )
+        await viewModel.loadLanguages()
+
+        await viewModel.releaseSpeechLocale("en-US")
+
+        XCTAssertEqual(viewModel.errorMessage, "无法释放语音模型 en-US。")
+        XCTAssertTrue(viewModel.canStartBroadcast)
+    }
+
     func testBeginningPreparationIsBlockedWhileReleaseIsInFlight() async {
         let resourceService = BlockingLanguageResourceService(
             state: .init(
