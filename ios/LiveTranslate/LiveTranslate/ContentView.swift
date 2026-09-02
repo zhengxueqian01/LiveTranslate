@@ -11,7 +11,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var viewModel: AppViewModel
     @State private var translationConfiguration: TranslationSession.Configuration?
-    @State private var translationSourceLanguage: SourceLanguage = .english
+    @State private var translationPreparation: LanguagePairConfiguration?
     @StateObject private var captionPiPController = CaptionPiPController()
 
     init(viewModel: AppViewModel? = nil) {
@@ -19,29 +19,68 @@ struct ContentView: View {
     }
 
     var body: some View {
-        let sourceLanguage = translationSourceLanguage
-
         NavigationStack {
             Form {
                 Section("输入语言") {
-                    Picker("音频语言", selection: $viewModel.selectedLanguage) {
-                        Text("英语").tag(SourceLanguage.english)
-                        Text("日语").tag(SourceLanguage.japanese)
+                    Picker("音频语言", selection: inputSelection) {
+                        ForEach(viewModel.inputLanguages) { option in
+                            Text(option.displayName).tag(option.localeIdentifier)
+                        }
                     }
-                    Text("目标语言：简体中文")
-                        .foregroundStyle(.secondary)
+                    Picker("目标语言", selection: outputSelection) {
+                        ForEach(viewModel.outputLanguages) { option in
+                            Text(option.displayName).tag(option.languageIdentifier)
+                        }
+                    }
+                    if viewModel.inputLanguages.isEmpty || viewModel.outputLanguages.isEmpty {
+                        Text("正在读取系统支持的语言…")
+                            .foregroundStyle(.secondary)
+                    }
+                    if viewModel.languageCatalogErrorMessage != nil {
+                        Button("重新加载语言") {
+                            Task { await viewModel.loadLanguages() }
+                        }
+                    }
                 }
 
                 Section("本地模型") {
                     LabeledContent("语音识别", value: speechStatusText)
-                    LabeledContent(
-                        "翻译",
-                        value: viewModel.isTranslationReady ? "已准备" : "待准备"
-                    )
-                    if viewModel.speechStatus == .needsDownload {
-                        Button("下载语音模型") {
-                            Task { await viewModel.installSpeechModel() }
+                    LabeledContent("翻译", value: translationStatusText)
+                    if let preparationStatusText {
+                        Text(preparationStatusText)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    if viewModel.currentConfiguration != nil, !viewModel.resourceState.isReady {
+                        Button("下载所需模型") {
+                            Task {
+                                guard case .prepareTranslation(let pair) = await viewModel.beginModelPreparation() else {
+                                    return
+                                }
+                                translationPreparation = pair
+                                if #available(iOS 26.4, *) {
+                                    translationConfiguration = TranslationSession.Configuration(
+                                        source: Locale.Language(
+                                            identifier: pair.sourceTranslationLanguageIdentifier
+                                        ),
+                                        target: Locale.Language(
+                                            identifier: pair.targetTranslationLanguageIdentifier
+                                        ),
+                                        preferredStrategy: .lowLatency
+                                    )
+                                } else {
+                                    translationConfiguration = TranslationSession.Configuration(
+                                        source: Locale.Language(
+                                            identifier: pair.sourceTranslationLanguageIdentifier
+                                        ),
+                                        target: Locale.Language(
+                                            identifier: pair.targetTranslationLanguageIdentifier
+                                        )
+                                    )
+                                }
+                            }
                         }
+                        .disabled(!canBeginModelPreparation)
                     }
                 }
 
@@ -100,8 +139,7 @@ struct ContentView: View {
             .task {
                 viewModel.refreshCaption()
                 viewModel.startCaptionObservation()
-                await viewModel.refreshModelStatus()
-                configureTranslation()
+                await viewModel.loadLanguages()
             }
             .onAppear {
                 captionPiPController.didStop = {
@@ -118,28 +156,78 @@ struct ContentView: View {
                 viewModel.stopCaptionObservation()
                 captionPiPController.stop()
             }
-            .onChange(of: viewModel.selectedLanguage) {
-                viewModel.markTranslationNeedsPreparation()
-                configureTranslation()
-                Task { await viewModel.refreshModelStatus() }
-            }
             .translationTask(translationConfiguration) { session in
+                guard let pair = translationPreparation else { return }
                 do {
                     try await session.prepareTranslation()
-                    await MainActor.run {
-                        viewModel.markTranslationReady(for: sourceLanguage)
-                    }
+                    await viewModel.finishTranslationPreparation(for: pair, error: nil)
                 } catch {
-                    await MainActor.run {
-                        viewModel.reportTranslationError(error, for: sourceLanguage)
-                    }
+                    await viewModel.finishTranslationPreparation(for: pair, error: error)
                 }
+                translationPreparation = nil
+                translationConfiguration = nil
             }
         }
     }
 
+    private var inputSelection: Binding<String> {
+        Binding(
+            get: { viewModel.selectedInput?.localeIdentifier ?? "" },
+            set: { identifier in
+                Task { await viewModel.selectInput(identifier: identifier) }
+            }
+        )
+    }
+
+    private var outputSelection: Binding<String> {
+        Binding(
+            get: { viewModel.selectedOutput?.languageIdentifier ?? "" },
+            set: { identifier in
+                Task { await viewModel.selectOutput(identifier: identifier) }
+            }
+        )
+    }
+
+    private var canBeginModelPreparation: Bool {
+        guard translationConfiguration == nil,
+              viewModel.preparationPhase == .idle else {
+            return false
+        }
+        let speech = viewModel.resourceState.speech.status
+        let translation = viewModel.resourceState.translation
+        return speech != .unknown
+            && speech != .unsupported
+            && speech != .downloading
+            && translation != .unknown
+            && translation != .unsupported
+            && translation != .downloading
+    }
+
     private var speechStatusText: String {
-        switch viewModel.speechStatus {
+        let state = viewModel.resourceState.speech
+        if state.status == .installed, !state.isReserved {
+            return "已安装，待预留"
+        }
+        return resourceStatusText(state.status)
+    }
+
+    private var translationStatusText: String {
+        resourceStatusText(viewModel.resourceState.translation)
+    }
+
+    private var preparationStatusText: String? {
+        switch viewModel.preparationPhase {
+        case .idle:
+            nil
+        case .preparingSpeech:
+            "正在准备语音模型…"
+        case .preparingTranslation:
+            "正在准备翻译模型…"
+        }
+    }
+
+    private func resourceStatusText(_ status: ModelResourceStatus) -> String {
+        switch status {
         case .unknown:
             "检查中"
         case .unsupported:
@@ -152,23 +240,6 @@ struct ContentView: View {
             "已安装"
         case .notRequired:
             "无需翻译"
-        }
-    }
-
-    private func configureTranslation() {
-        let sourceLanguage = viewModel.selectedLanguage
-        translationSourceLanguage = sourceLanguage
-        if #available(iOS 26.4, *) {
-            translationConfiguration = TranslationSession.Configuration(
-                source: sourceLanguage.translationSource,
-                target: SourceLanguage.translationTarget,
-                preferredStrategy: .lowLatency
-            )
-        } else {
-            translationConfiguration = TranslationSession.Configuration(
-                source: sourceLanguage.translationSource,
-                target: SourceLanguage.translationTarget
-            )
         }
     }
 }

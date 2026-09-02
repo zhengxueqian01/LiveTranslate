@@ -7,135 +7,223 @@ protocol ModelPreparing: Sendable {
     func installSpeechModel(for source: SourceLanguage) async throws
 }
 
+enum ModelPreparationAction: Equatable, Sendable {
+    case none
+    case prepareTranslation(LanguagePairConfiguration)
+}
+
+enum ModelPreparationPhase: Equatable, Sendable {
+    case idle
+    case preparingSpeech
+    case preparingTranslation
+}
+
 @MainActor
 final class AppViewModel: ObservableObject {
-    @Published var selectedLanguage: SourceLanguage {
-        didSet {
-            languageStore?.save(selectedLanguage)
-        }
-    }
-    @Published private(set) var speechStatus: ModelResourceStatus = .unknown
-    @Published private(set) var isTranslationReady = false
+    @Published private(set) var inputLanguages: [SpeechLanguageOption] = []
+    @Published private(set) var outputLanguages: [TranslationLanguageOption] = []
+    @Published var selectedInput: SpeechLanguageOption?
+    @Published var selectedOutput: TranslationLanguageOption?
+    @Published private(set) var resourceState = LanguagePairResourceState(
+        speech: .init(status: .unknown, isReserved: false),
+        translation: .unknown
+    )
+    @Published private(set) var preparationPhase: ModelPreparationPhase = .idle
     @Published private(set) var latestSnapshot: CaptionSnapshot?
+    @Published private(set) var languageCatalogErrorMessage: String?
     @Published private(set) var errorMessage: String?
 
-    private let modelService: any ModelPreparing
+    private let catalogService: any LanguageCatalogProviding
+    private let resourceService: any LanguageResourceManaging
     private let store: (any CaptionStoreProtocol)?
-    private let languageStore: SourceLanguageStore?
+    private let languageStore: any LanguageConfigurationStoring
+    private let displayLocale: Locale
     private let storageErrorMessage: String?
-    private var speechErrorMessage: String?
-    private var translationErrorMessage: String?
+    private var modelErrorMessage: String?
     private var captionErrorMessage: String?
     private var captionObservationTask: Task<Void, Never>?
+    private var requestGeneration: UInt64 = 0
+    private var selectionGeneration: UInt64 = 0
+
+    var currentConfiguration: LanguagePairConfiguration? {
+        guard let selectedInput, let selectedOutput else { return nil }
+        return .init(
+            sourceSpeechLocaleIdentifier: selectedInput.localeIdentifier,
+            sourceTranslationLanguageIdentifier: selectedInput.translationLanguageIdentifier,
+            targetTranslationLanguageIdentifier: selectedOutput.languageIdentifier
+        )
+    }
 
     var canStartBroadcast: Bool {
-        store != nil && speechStatus == .installed && isTranslationReady && errorMessage == nil
+        store != nil && resourceState.isReady && errorMessage == nil
     }
 
     init(
-        modelService: any ModelPreparing,
+        catalogService: any LanguageCatalogProviding,
+        resourceService: any LanguageResourceManaging,
         store: (any CaptionStoreProtocol)?,
-        languageStore: SourceLanguageStore
+        languageStore: any LanguageConfigurationStoring,
+        displayLocale: Locale = .current
     ) {
-        self.modelService = modelService
+        self.catalogService = catalogService
+        self.resourceService = resourceService
         self.store = store
         self.languageStore = languageStore
+        self.displayLocale = displayLocale
         storageErrorMessage = store == nil
             ? "无法打开 App Group，请检查两个 Target 的签名与 App Group 配置。"
             : nil
-        speechErrorMessage = nil
-        translationErrorMessage = nil
+        modelErrorMessage = nil
         captionErrorMessage = nil
         captionObservationTask = nil
-        selectedLanguage = languageStore.load() ?? .english
+        languageCatalogErrorMessage = nil
         errorMessage = storageErrorMessage
-    }
-
-    private init(modelService: any ModelPreparing, errorMessage: String) {
-        self.modelService = modelService
-        store = nil
-        languageStore = nil
-        storageErrorMessage = errorMessage
-        speechErrorMessage = nil
-        translationErrorMessage = nil
-        captionErrorMessage = nil
-        captionObservationTask = nil
-        selectedLanguage = .english
-        self.errorMessage = errorMessage
     }
 
     static func live() -> AppViewModel {
         guard let defaults = UserDefaults(suiteName: CaptionStore.appGroupIdentifier) else {
             return AppViewModel(
-                modelService: ModelPreparationService(),
-                errorMessage: "无法打开 App Group，请检查两个 Target 的签名与 App Group 配置。"
+                catalogService: SystemLanguageCatalogService(),
+                resourceService: SystemLanguageResourceService(),
+                store: nil,
+                languageStore: UnavailableLanguageConfigurationStore()
             )
         }
         return AppViewModel(
-            modelService: ModelPreparationService(),
+            catalogService: SystemLanguageCatalogService(),
+            resourceService: SystemLanguageResourceService(),
             store: CaptionStore(defaults: defaults),
-            languageStore: SourceLanguageStore(defaults: defaults)
+            languageStore: LanguageConfigurationStore(defaults: defaults)
         )
     }
 
-    func refreshModelStatus() async {
-        let source = selectedLanguage
-        let status = await modelService.speechStatus(for: source)
-        guard source == selectedLanguage else {
-            return
-        }
-        speechStatus = status
-    }
-
-    func installSpeechModel() async {
-        let source = selectedLanguage
-        speechStatus = .downloading
-        speechErrorMessage = nil
+    func loadLanguages() async {
+        selectionGeneration &+= 1
+        let generation = nextRequestGeneration()
+        inputLanguages = []
+        outputLanguages = []
+        selectedInput = nil
+        selectedOutput = nil
+        resourceState = Self.unknownResourceState
+        preparationPhase = .idle
+        languageCatalogErrorMessage = nil
+        modelErrorMessage = nil
         refreshErrorMessage()
+
         do {
-            try await modelService.installSpeechModel(for: source)
-            guard source == selectedLanguage else {
-                return
+            let snapshot = try await catalogService.load(displayLocale: displayLocale)
+            guard generation == requestGeneration else { return }
+            guard !snapshot.inputLanguages.isEmpty, !snapshot.outputLanguages.isEmpty else {
+                throw LanguageCatalogLoadError.emptyCatalog
             }
-            await refreshModelStatus()
+
+            inputLanguages = snapshot.inputLanguages
+            outputLanguages = snapshot.outputLanguages
+            let resolved = resolveSelection(
+                saved: languageStore.load(),
+                snapshot: snapshot
+            )
+            selectedInput = resolved.input
+            selectedOutput = resolved.output
+            persistCurrentConfiguration()
+            await refreshResourceStatus()
         } catch {
-            guard source == selectedLanguage else {
-                return
-            }
-            speechStatus = .needsDownload
-            speechErrorMessage = "语音模型下载失败：\(error.localizedDescription)"
+            guard generation == requestGeneration else { return }
+            inputLanguages = []
+            outputLanguages = []
+            selectedInput = nil
+            selectedOutput = nil
+            resourceState = Self.unknownResourceState
+            preparationPhase = .idle
+            languageCatalogErrorMessage = "语言列表加载失败：\(error.localizedDescription)"
             refreshErrorMessage()
         }
     }
 
-    func markTranslationReady(for source: SourceLanguage) {
-        guard source == selectedLanguage else {
+    func selectInput(identifier: String) async {
+        guard let option = inputLanguages.first(where: { $0.localeIdentifier == identifier }) else {
             return
         }
-        isTranslationReady = true
-        translationErrorMessage = nil
-        refreshErrorMessage()
+        selectedInput = option
+        selectionDidChange()
+        persistCurrentConfiguration()
+        await refreshResourceStatus()
     }
 
-    func markTranslationReady() {
-        markTranslationReady(for: selectedLanguage)
-    }
-
-    func markTranslationNeedsPreparation() {
-        isTranslationReady = false
-    }
-
-    func reportTranslationError(_ error: any Error, for source: SourceLanguage) {
-        guard source == selectedLanguage else {
+    func selectOutput(identifier: String) async {
+        guard let option = outputLanguages.first(where: { $0.languageIdentifier == identifier }) else {
             return
         }
-        isTranslationReady = false
-        translationErrorMessage = "翻译模型准备失败：\(error.localizedDescription)"
-        refreshErrorMessage()
+        selectedOutput = option
+        selectionDidChange()
+        persistCurrentConfiguration()
+        await refreshResourceStatus()
     }
 
-    func reportTranslationError(_ error: any Error) {
-        reportTranslationError(error, for: selectedLanguage)
+    func refreshResourceStatus() async {
+        guard let request = currentConfiguration else {
+            resourceState = Self.unknownResourceState
+            return
+        }
+        let generation = nextRequestGeneration()
+        resourceState = Self.unknownResourceState
+        let state = await resourceService.status(for: request)
+        guard generation == requestGeneration, request == currentConfiguration else {
+            return
+        }
+        resourceState = state
+    }
+
+    func beginModelPreparation() async -> ModelPreparationAction {
+        guard preparationPhase == .idle,
+              let request = currentConfiguration,
+              resourceState.speech.status != .unsupported,
+              resourceState.translation != .unsupported else {
+            return .none
+        }
+        let generation = selectionGeneration
+        preparationPhase = .preparingSpeech
+        modelErrorMessage = nil
+        refreshErrorMessage()
+        do {
+            if !resourceState.speech.isReady {
+                try await resourceService.prepareSpeech(
+                    localeIdentifier: request.sourceSpeechLocaleIdentifier
+                )
+            }
+            guard generation == selectionGeneration, request == currentConfiguration else {
+                return .none
+            }
+            await refreshResourceStatus()
+            guard generation == selectionGeneration, request == currentConfiguration else {
+                return .none
+            }
+            if resourceState.translation == .needsDownload {
+                preparationPhase = .preparingTranslation
+                return .prepareTranslation(request)
+            }
+            preparationPhase = .idle
+            return .none
+        } catch {
+            guard generation == selectionGeneration, request == currentConfiguration else {
+                return .none
+            }
+            preparationPhase = .idle
+            modelErrorMessage = "模型准备失败：\(error.localizedDescription)"
+            refreshErrorMessage()
+            return .none
+        }
+    }
+
+    func finishTranslationPreparation(
+        for configuration: LanguagePairConfiguration,
+        error: (any Error)?
+    ) async {
+        guard configuration == currentConfiguration else { return }
+        preparationPhase = .idle
+        modelErrorMessage = error.map { "翻译模型准备失败：\($0.localizedDescription)" }
+        await refreshResourceStatus()
+        refreshErrorMessage()
     }
 
     func refreshCaption() {
@@ -185,10 +273,91 @@ final class AppViewModel: ObservableObject {
         captionObservationTask?.cancel()
     }
 
+    private static let unknownResourceState = LanguagePairResourceState(
+        speech: .init(status: .unknown, isReserved: false),
+        translation: .unknown
+    )
+
+    private func nextRequestGeneration() -> UInt64 {
+        requestGeneration &+= 1
+        return requestGeneration
+    }
+
+    private func selectionDidChange() {
+        selectionGeneration &+= 1
+        preparationPhase = .idle
+        resourceState = Self.unknownResourceState
+        modelErrorMessage = nil
+        refreshErrorMessage()
+    }
+
+    private func persistCurrentConfiguration() {
+        guard let currentConfiguration else { return }
+        languageStore.save(currentConfiguration)
+    }
+
+    private func resolveSelection(
+        saved: LanguagePairConfiguration?,
+        snapshot: LanguageCatalogSnapshot
+    ) -> (input: SpeechLanguageOption, output: TranslationLanguageOption) {
+        if let saved,
+           let input = snapshot.inputLanguages.first(where: {
+               $0.localeIdentifier == saved.sourceSpeechLocaleIdentifier
+                   && $0.translationLanguageIdentifier == saved.sourceTranslationLanguageIdentifier
+           }),
+           let output = snapshot.outputLanguages.first(where: {
+               $0.languageIdentifier == saved.targetTranslationLanguageIdentifier
+           }) {
+            return (input, output)
+        }
+
+        let input = preferredSystemInput(from: snapshot.inputLanguages)
+            ?? snapshot.inputLanguages[0]
+        let output = snapshot.outputLanguages.first(where: {
+            $0.languageIdentifier == "zh-Hans"
+        }) ?? snapshot.outputLanguages[0]
+        return (input, output)
+    }
+
+    private func preferredSystemInput(
+        from options: [SpeechLanguageOption]
+    ) -> SpeechLanguageOption? {
+        let current = Locale.current
+        let canonicalIdentifier = Locale.canonicalIdentifier(from: current.identifier)
+        if let exact = options.first(where: {
+            Locale.canonicalIdentifier(from: $0.localeIdentifier) == canonicalIdentifier
+        }) {
+            return exact
+        }
+
+        guard let languageCode = current.language.languageCode?.identifier else {
+            return nil
+        }
+        return options.first(where: {
+            Locale(identifier: $0.localeIdentifier).language.languageCode?.identifier == languageCode
+        })
+    }
+
     private func refreshErrorMessage() {
         errorMessage = storageErrorMessage
             ?? captionErrorMessage
-            ?? speechErrorMessage
-            ?? translationErrorMessage
+            ?? languageCatalogErrorMessage
+            ?? modelErrorMessage
+    }
+}
+
+private struct UnavailableLanguageConfigurationStore: LanguageConfigurationStoring {
+    func load() -> LanguagePairConfiguration? {
+        nil
+    }
+
+    func save(_ configuration: LanguagePairConfiguration) {}
+}
+
+private enum LanguageCatalogLoadError: LocalizedError {
+    case emptyCatalog
+
+    var errorDescription: String? {
+        "系统未返回可用的输入和输出语言。"
     }
 }
